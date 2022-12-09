@@ -72,7 +72,7 @@ fn MINIRV32_HANDLE_MEM_LOAD_CONTROL(a: u32, b: u32) {
 // uint4's.  We are going to uint4 data to/from system RAM.
 //
 // We're going to try to keep the full processor state to 12 x uint4.
-struct MiniRV32IMAState { 
+pub struct MiniRV32IMAState { 
 	pub regs: [u32; 32], //u32 regs[32];
 
 	pub pc: u32, //u32 pc;
@@ -108,7 +108,7 @@ impl MiniRV32IMAState {
 	}
 }
 
-struct RVImage {
+pub struct RVImage {
     image: Vec<u8>,
 
 }
@@ -162,7 +162,7 @@ impl RVImage {
 //     // )
 // }
 
-pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddress: u32, elapsedUs: u32, count: i32 ) -> i32 {
+pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, mut image: RVImage, vProcAddress: u32, elapsedUs: u32, count: i32 ) -> i32 {
 	let new_timer: u32 = state.timerl + elapsedUs;
 	if new_timer < state.timerl {
         state.timerh += 1;
@@ -188,9 +188,9 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 
     for icount in 0..count {
 
-		let ir = 0;
+		let mut ir = 0;
 		let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
-		let rval = 0;
+		let mut rval = 0;
 
 		// Increment both wall-clock and instruction count time.  (NOTE: Not strictly needed to run Linux)
 		state.cyclel += 1;
@@ -198,7 +198,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
             state.cycleh += 1;
         }
 
-		let pc: u32 = state.pc;
+		let mut pc: u32 = state.pc;
 		let ofs_pc: u32 = pc - MINIRV32_RAM_IMAGE_OFFSET;
 
 		if ofs_pc  >= MINI_RV32_RAM_SIZE {
@@ -208,7 +208,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 			trap = 1 + 0;  //Handle PC-misaligned access
         } else {
 			ir = image.load32( ofs_pc );
-			let rdid: u32 = (ir >> 7) & 0x1f;
+			let mut rdid: u32 = (ir >> 7) & 0x1f;
 
 			match ir & 0x7f {
 				0b0110111 => { // LUI
@@ -220,7 +220,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 				}
 				0b1101111 => { // JAL
 				
-					let reladdy: u32 = ((ir & 0x80000000)>>11) | ((ir & 0x7fe00000)>>20) | ((ir & 0x00100000)>>9) | ((ir&0x000ff000));
+					let mut reladdy: u32 = ((ir & 0x80000000)>>11) | ((ir & 0x7fe00000)>>20) | ((ir & 0x00100000)>>9) | ((ir&0x000ff000));
 					if reladdy & 0x00100000 != 0 { 
 						reladdy |= 0xffe00000; // Sign extension.
 					}
@@ -239,7 +239,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 				}
 				0b1100011 => { // Branch
 				
-					let immm4: u32 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
+					let mut immm4: u32 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
 					if immm4 & 0x1000 != 0 {immm4 |= 0xffffe000; }
 					let rs1: u32  = state.reg((ir >> 15) & 0x1f);
 					let rs2: u32  = state.reg((ir >> 20) & 0x1f);
@@ -263,7 +263,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 					let imm: u32 = ir >> 20;
 					let xx = if imm & 0x800 != 0 {0xfffff000}else{0};
 					let imm_se: u32 = imm | xx;
-					let rsval: u32 = rs1 + imm_se;
+					let mut rsval: u32 = rs1 + imm_se;
 
 					rsval -= MINIRV32_RAM_IMAGE_OFFSET;
 					if rsval >= MINI_RV32_RAM_SIZE-3 {
@@ -301,7 +301,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 				
 					let rs1: u32 = state.reg((ir >> 15) & 0x1f);
 					let rs2: u32 = state.reg((ir >> 20) & 0x1f);
-					let addy: u32 = ( ( ir >> 7 ) & 0x1f ) | ( ( ir & 0xfe000000 ) >> 20 );
+					let mut addy: u32 = ( ( ir >> 7 ) & 0x1f ) | ( ( ir & 0xfe000000 ) >> 20 );
 					if addy & 0x800 != 0 { addy |= 0xfffff000;}
 					addy += rs1 - MINIRV32_RAM_IMAGE_OFFSET;
 					rdid = 0;
@@ -362,6 +362,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 							0b101 => { if rs2 == 0 { rval = 0xffffffff; }else{ rval = rs1 / rs2; }}// DIVU
 							0b110 => { if rs2 == 0 { rval = rs1; }else{ rval = ((rs1 as i32) % (rs2 as i32)) as u32; }} // REM
 							0b111 => { if rs2 == 0 { rval = rs1; }else{ rval = rs1 % rs2; }} // REMU
+							_default => {}
 						}
 					}
 					else
@@ -376,6 +377,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 							0b101 => { rval = if ir & 0x40000000 != 0 {  ((rs1 as i32) >> rs2) as u32  }else{ rs1 >> rs2 }; }
 							0b110 => { rval = rs1 | rs2; }
 							0b111 => { rval = rs1 & rs2; }
+							_default => {}
 						}
 					}
 					break;
@@ -391,7 +393,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 					{
 						let rs1imm = (ir >> 15) & 0x1f;
 						let rs1 = state.reg(rs1imm);
-						let writeval = rs1;
+						let mut writeval = rs1;
 
 						// https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
 						// Generally, support for Zicsr
@@ -426,6 +428,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 							0b101 => { writeval = rs1imm; }			//CSRRWI
 							0b110 => { writeval = rval | rs1imm; }	//CSRRSI
 							0b111 => { writeval = rval & !rs1imm; }	//CSRRCI
+							_default => {}
 						}
 
 						match( csrno ) {
@@ -489,8 +492,8 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 				}
 				0b0101111 => { // RV32A
 				
-					let rs1 = state.reg((ir >> 15) & 0x1f);
-					let rs2 = state.reg((ir >> 20) & 0x1f);
+					let mut rs1 = state.reg((ir >> 15) & 0x1f);
+					let mut rs2 = state.reg((ir >> 20) & 0x1f);
 					let irmid = ( ir>>27 ) & 0x1f;
 
 					rs1 -= MINIRV32_RAM_IMAGE_OFFSET;
@@ -507,7 +510,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 						rval = image.load32( rs1 );
 
 						// Referenced a little bit of https://github.com/franzflasch/riscv_em/blob/master/src/core/core.c
-						let dowrite = true;
+						let mut dowrite = true;
 						match ( irmid )
 						{
 							0b00010 => {dowrite = false; } //LR.W
@@ -579,4 +582,9 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
 		state.pc = pc + 4;
 	}
 	return 0;
+}
+
+
+pub fn main() {
+	
 }
