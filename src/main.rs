@@ -13,49 +13,149 @@
         * Feel free to override any of the functionality with macros.
 */
 
-// #define MINIRV32WARN( x... );
 
-// #define MINIRV32_DECORATE static
+
+pub fn main() {
+    let ram_amt: u32 = 64 * 1024 * 1024;
+    let mut instct: u64 = -1 as i32 as u32 as u64;
+    let show_help = 0;
+    let time_divisor = 1;
+    let fixed_update = false;
+    let do_sleep = true;
+    let single_step = false;
+
+    let ram_image: Vec<u8>;
+    let mut core: MiniRV32IMAState;
+
+    let dtb_ptr: u32 = 0;
+    ram_image = Vec::with_capacity(ram_amt as usize);
+
+    let mut ram_image = RVImage { image: ram_image };
+
+    // The core lives at the end of RAM.
+    //core = (MiniRV32IMAState *)(ram_image + ram_amt - sizeof( struct MiniRV32IMAState ));
+    core = MiniRV32IMAState::default();
+    core.pc = MINIRV32_RAM_IMAGE_OFFSET;
+    core.regs[10] = 0x00; //hart ID
+    core.regs[11] = if dtb_ptr != 0 {
+        dtb_ptr + MINIRV32_RAM_IMAGE_OFFSET
+    } else {
+        0
+    }; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
+    core.extraflags |= 3; // Machine-mode.
+
+    // Image is loaded.
+
+    let mut last_time: u64 = if fixed_update {
+        0
+    } else {
+        time_now_micros() / time_divisor
+    };
+    let instrs_per_flip = if single_step { 1 } else { 1024 };
+    let mut rt: u64 = 0;
+    while rt < instct + 1 {
+        //u64 * this_ccount = ((u64*)&core->cyclel);
+        let elapsed_us: u64;
+        if fixed_update {
+            elapsed_us = core.cycle() / time_divisor - last_time;
+        } else {
+            elapsed_us = time_now_micros() / time_divisor - last_time;
+        }
+        last_time += elapsed_us;
+
+        if single_step {
+            dump_state(&core, &ram_image, &ram_amt);
+        }
+        let ret = mini_rv32_ima_step(
+            &mut core,
+            &mut ram_image,
+            0,
+            elapsed_us as u32,
+            instrs_per_flip,
+        ); // Execute upto 1024 cycles before breaking out.
+        match ret {
+            0 => break,
+            1 => {
+                if do_sleep {
+                    //MiniSleep();
+                    core.set_cycle(core.cycle() + instrs_per_flip as u64);
+                }
+            }
+            3 => {
+                instct = 0;
+            }
+            0x7777 => {
+                //goto restart;	//syscon code for restart
+            }
+            0x5555 => {
+                println!("POWEROFF@{}{}", core.cycleh, core.cyclel);
+                return; //syscon code for power-off
+            }
+            _default => {
+                println!("Unknown failure");
+                break;
+            }
+        }
+
+        rt += instrs_per_flip as u64;
+    }
+
+    dump_state(&core, &ram_image, &ram_amt);
+}
+
+pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
+    let pc = core.pc;
+    let pc_offset = pc - MINIRV32_RAM_IMAGE_OFFSET;
+    let mut ir = 0;
+
+    println!("PC: {:#08x} ", pc);
+    if pc_offset < ram_amt - 3 {
+        ir = image.load32(pc_offset);
+        println!("[0x{:#08x}] ", ir);
+    } else {
+        println!("[xxxxxxxxxx] ");
+    }
+    let regs = &core.regs;
+    println!( "Z:{:#08x} ra:{:#08x} sp:{:#08x} gp:{:#08x} tp:{:#08x} t0:{:#08x} t1:{:#08x} t2:{:#08x} s0:{:#08x} s1:{:#08x} a0:{:#08x} a1:{:#08x} a2:{:#08x} a3:{:#08x} a4:{:#08x} a5:{:#08x} ",
+		regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+		regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15] );
+    println!( "a6:{:#08x} a7:{:#08x} s2:{:#08x} s3:{:#08x} s4:{:#08x} s5:{:#08x} s6:{:#08x} s7:{:#08x} s8:{:#08x} s9:{:#08x} s10:{:#08x} s11:{:#08x} t3:{:#08x} t4:{:#08x} t5:{:#08x} t6:{:#08x}\n",
+		regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
+		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
+}
+
+pub fn time_now_micros() -> u64 {
+    let start = std::time::SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Time went backwards");
+    since_the_epoch.as_micros() as u64
+}
 
 static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 16;
-
-// #define MINIRV32_RAM_IMAGE_OFFSET  0x80000000
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
-
-// #define MINIRV32_POSTEXEC(...);
 
 fn minirv32_postexec(_pc: u32, _ir: u32, _trap: u32) {}
 
-// #define MINIRV32_HANDLE_MEM_STORE_CONTROL(...);
-
 fn minirv32_handle_mem_store_control(_addy: u32, _rs2: u32) {}
-
-// #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(...);
 
 fn minirv32_handle_mem_load_control(_rsval: u32, _rval: u32) {}
 
-// #define MINIRV32_OTHERCSR_WRITE(...);
 fn minirv32_othercsr_write(_csrno: u32, _writeval: u32) {}
 
-// #define MINIRV32_OTHERCSR_READ(...);
 fn minirv32_othercsr_read(_csrno: u32, _rval: u32) {}
-
-// #define MINIRV32_STORE4( ofs, val ) *(u32*)(image + ofs) = val
-// #define MINIRV32_STORE2( ofs, val ) *(u16*)(image + ofs) = val
-// #define MINIRV32_STORE1( ofs, val ) *(u8*)(image + ofs) = val
-// #define MINIRV32_LOAD4( ofs ) *(u32*)(image + ofs)
-// #define MINIRV32_LOAD2( ofs ) *(u16*)(image + ofs)
-// #define MINIRV32_LOAD1( ofs ) *(u8*)(image + ofs)
 
 // As a note: We quouple-ify these, because in HLSL, we will be operating with
 // uint4's.  We are going to uint4 data to/from system RAM.
 //
 // We're going to try to keep the full processor state to 12 x uint4.
-pub struct MiniRV32IMAState {
-    pub regs: [u32; 32], //u32 regs[32];
 
-    pub pc: u32,      //u32 pc;
-    pub mstatus: u32, // mstatus;
+#[derive(Clone, Default)]
+pub struct MiniRV32IMAState {
+    pub regs: [u32; 32],
+
+    pub pc: u32,
+    pub mstatus: u32,
     pub cyclel: u32,
     pub cycleh: u32,
 
@@ -85,6 +185,12 @@ impl MiniRV32IMAState {
     pub fn regset(&mut self, reg_index: u32, value: u32) {
         self.regs[reg_index as usize] = value
     }
+    pub fn cycle(&self) -> u64 {
+        self.cyclel as u64
+    }
+    pub fn set_cycle(&mut self, cycle: u64) {
+        self.cyclel = cycle as u32
+    }
 }
 
 pub struct RVImage {
@@ -92,7 +198,8 @@ pub struct RVImage {
 }
 impl RVImage {
     pub fn load32(&self, offset: u32) -> u32 {
-        let slice = &self.image[offset as usize..(offset + 4) as usize];
+        let ofs = offset as usize;
+        let slice = &self.image[ofs..ofs + 4];
 
         // Always safe, since slice above is checked
         <u32>::from_le_bytes(unsafe {
@@ -100,7 +207,8 @@ impl RVImage {
         })
     }
     pub fn load16(&self, offset: u32) -> u16 {
-        let slice = &self.image[offset as usize..(offset + 2) as usize];
+        let ofs = offset as usize;
+        let slice = &self.image[ofs..ofs + 2];
 
         // Always safe, since slice above is checked
         <u16>::from_le_bytes(unsafe {
@@ -110,33 +218,34 @@ impl RVImage {
     pub fn load8(&self, offset: u32) -> u8 {
         self.image[offset as usize]
     }
-    pub fn store32(&mut self, offset: u32, value: u32) {}
-    pub fn store16(&mut self, offset: u32, value: u16) {}
-    pub fn store8(&mut self, offset: u32, value: u8) {}
+    pub fn store32(&mut self, offset: u32, val: u32) {
+        let ofs = offset as usize;
+        let slice = &mut self.image[ofs..ofs + 4];
+
+        // Always safe, since slice above is checked
+        unsafe {
+            let ptr = slice.as_mut_ptr() as *mut [u8; core::mem::size_of::<u32>()];
+            *ptr = val.to_le_bytes();
+        };
+    }
+    pub fn store16(&mut self, offset: u32, val: u16) {
+        let ofs = offset as usize;
+        let slice = &mut self.image[ofs..ofs + 2];
+
+        // Always safe, since slice above is checked
+        unsafe {
+            let ptr = slice.as_mut_ptr() as *mut [u8; core::mem::size_of::<u16>()];
+            *ptr = val.to_le_bytes();
+        };
+    }
+    pub fn store8(&mut self, offset: u32, val: u8) {
+        self.image[offset as usize] = val
+    }
 }
-
-// #ifdef MINIRV32_IMPLEMENTATION
-
-// #define CSR( x ) state->x
-// #define SETCSR( x, val ) { state->x = val; }
-// #define REG( x ) state->regs[x]
-// #define REGSET( x, val ) { state->regs[x] = val; }
-
-// macro_rules! csr {
-//     // Base case:
-//     ($x:expr) => (
-//         state.x
-//     );
-//     // `$x` followed by at least one `$y,`
-//     // ($x:expr, $($y:expr),+) => (
-//     //     // Call `find_min!` on the tail `$y`
-//     //     std::cmp::min($x, find_min!($($y),+))
-//     // )
-// }
 
 pub fn mini_rv32_ima_step(
     state: &mut MiniRV32IMAState,
-    mut image: RVImage,
+    image: &mut RVImage,
     _v_proc_address: u32,
     elapsed_us: u32,
     count: i32,
@@ -473,8 +582,8 @@ pub fn mini_rv32_ima_step(
                     let csrno = ir >> 20;
                     let microop = (ir >> 12) & 0b111;
                     if (microop & 3) != 0 {
-                    // It's a Zicsr function.
-                    
+                        // It's a Zicsr function.
+
                         let rs1imm = (ir >> 15) & 0x1f;
                         let rs1 = state.reg(rs1imm);
                         let mut writeval = rs1;
@@ -550,19 +659,19 @@ pub fn mini_rv32_ima_step(
                             }
                         }
                     } else if microop == 0b000 {
-                    // "SYSTEM"
-                    
+                        // "SYSTEM"
+
                         rdid = 0;
                         if csrno == 0x105 {
-                        //WFI (Wait for interrupts)
-                        
+                            //WFI (Wait for interrupts)
+
                             state.mstatus |= 8; //Enable interrupts
                             state.extraflags |= 4; //Infor environment we want to go to sleep.
                             state.pc = pc + 4;
                             return 1;
                         } else if (csrno & 0xff) == 0x02 {
-                        // MRET
-                        
+                            // MRET
+
                             //https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
                             //Table 7.6. MRET then in mstatus/mstatush sets MPV=0, MPP=0, MIE=MPIE, and MPIE=1. La
                             // Should also update mstatus to reflect correct mode.
@@ -714,5 +823,3 @@ pub fn mini_rv32_ima_step(
     }
     return 0;
 }
-
-pub fn main() {}
