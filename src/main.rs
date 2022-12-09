@@ -47,20 +47,19 @@ static DEBUG_INSTR: bool = false;
 
 pub fn main() {
     let ram_amt: u32 = MINI_RV32_RAM_SIZE;
-    let mut instct: u64 = 13000_000_000 as u64;
+    let mut instct: u64 = 46_700_000 as u64;
     //let show_help = 0;
     let time_divisor = 1;
     let fixed_time_update = false;
     let do_sleep = true;
     let single_step = false;
 
-    let mut ram_image = RVImage {
-        image: vec![0; ram_amt as usize],
-    };
+    let mut image = vec![0; ram_amt as usize];
+
 
     {
         let file_image = include_bytes!("DownloadedImage");
-        let im = &mut ram_image.image[..file_image.len()];
+        let im = &mut image[..file_image.len()];
         im.copy_from_slice(file_image);
     }
 
@@ -71,7 +70,7 @@ pub fn main() {
         let dtb_len = dbt_bytes.len();
         let core_len = core::mem::size_of::<MiniRV32IMAState>();
         let dtb_offset = ram_amt as usize - dtb_len - core_len;
-        let im = &mut ram_image.image[dtb_offset..dtb_offset + dtb_len];
+        let im = &mut image[dtb_offset..dtb_offset + dtb_len];
         im.copy_from_slice(dbt_bytes);
         // }
 
@@ -80,6 +79,9 @@ pub fn main() {
         // Warning - this will need to be updated if the skeleton DTB is ever modified.
         //let dtb_offset = (uint32_t*)(ram_image + dtb_ptr);
         let value_offset = dtb_offset as u32 + 0x13c;
+        let mut ram_image = RVImage {
+            image: &mut image,
+        };
         if ram_image.load32(value_offset) == 0x00c0ff03 {
             let validram = dtb_offset as u32;
             ram_image.store32be(value_offset, validram);
@@ -97,6 +99,9 @@ pub fn main() {
         proc_state = &mut proc_state_obj;
     } else {
         // The core lives at the end of RAM.
+        let mut ram_image = RVImage {
+            image: &mut image,
+        };
         proc_state = ref_core_last_bytes(&mut ram_image);
     }
     let reg_a1_ram_size = if opt_dtb_bytes.is_some() {
@@ -109,6 +114,8 @@ pub fn main() {
     proc_state.regs[11] = reg_a1_ram_size; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
 
     proc_state.extraflags |= 3; // Machine-mode.
+
+
 
     // Image is loaded.
     let mut last_time: u64 = if fixed_time_update {
@@ -127,12 +134,21 @@ pub fn main() {
         }
         last_time += elapsed_us;
 
+        
+
         if single_step {
-            dump_state(&proc_state, &ram_image, &ram_amt);
+            let mut ram_image = RVImage {
+                image: &mut image,
+            };
+            dump_state(&proc_state, &mut ram_image, &ram_amt);
         }
+
+        let ram_image = RVImage {
+            image: &mut image,
+        };
         let ret = mini_rv32_ima_step(
             &mut proc_state,
-            &mut ram_image,
+            ram_image,
             &mut handler,
             0,
             elapsed_us as u32,
@@ -171,6 +187,9 @@ pub fn main() {
     }
     println!("end of loop");
 
+    let ram_image = RVImage {
+        image: &mut image,
+    };
     dump_state(&proc_state, &ram_image, &ram_amt);
 }
 
@@ -257,6 +276,8 @@ impl RVHandlerImpl {
     }
 }
 impl RVHandler for RVHandlerImpl {
+
+    #[inline(never)]
     fn postexec(&mut self, _pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
         let fail_on_all_faults = false;
         if *retval > 0 {
@@ -271,6 +292,8 @@ impl RVHandler for RVHandlerImpl {
         return Ok(0);
     }
 
+    
+    #[inline(never)]
     fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
         if addy == 0x10000000 {
             //UART 8250 / 16550 Data Buffer
@@ -287,7 +310,7 @@ impl RVHandler for RVHandlerImpl {
         }
         return 0;
     }
-
+    #[inline(never)]
     fn handle_mem_load_control(&mut self, addy: u32) -> u32 {
         // Emulating a 8250 / 16550 UART
         if addy == 0x10000005 {
@@ -299,6 +322,7 @@ impl RVHandler for RVHandlerImpl {
         return 0;
     }
 
+    #[inline(never)]
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
         if csrno == 0x136 {
             println!("{}", value);
@@ -420,7 +444,7 @@ impl MiniRV32IMAState {
 
         #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.get_unchecked(reg_index as usize)
+            *self.regs.as_ptr().add(reg_index as usize)
         }
     }
     pub fn regset(&mut self, reg_index: u32, value: u32) {
@@ -430,7 +454,7 @@ impl MiniRV32IMAState {
         }
         #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.get_unchecked_mut(reg_index as usize) = value
+            *self.regs.as_mut_ptr().add(reg_index as usize) = value
         }
     }
     pub fn cycle(&self) -> u64 {
@@ -441,10 +465,10 @@ impl MiniRV32IMAState {
     }
 }
 
-pub struct RVImage {
-    image: Vec<u8>,
+pub struct RVImage<'a> {
+    image: &'a mut [u8],
 }
-impl RVImage {
+impl<'a> RVImage<'a> {
     pub fn load32(&self, offset: u32) -> u32 {
         #[cfg(debug_assertions)]
         {
@@ -598,7 +622,7 @@ impl RVImage {
 
 pub fn mini_rv32_ima_step<H: RVHandler>(
     state: &mut MiniRV32IMAState,
-    image: &mut RVImage,
+    mut image: RVImage,
     handler: &mut H,
     _v_proc_address: u32,
     elapsed_us: u32,
@@ -646,7 +670,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
         } else {
             ir = image.load32(ofs_pc);
             if DEBUG_INSTR {
-                println!("IR 0x{:08x}", ir);
+                //println!("IR 0x{:08x}", ir);
             }
             let mut rdid: u32 = (ir >> 7) & 0x1f;
 
@@ -710,7 +734,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     immm4 = (Wrapping(pc) + Wrapping(immm4) - Wrapping(4)).0;
 
                     if DEBUG_INSTR {
-                        println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
+                        //println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
                     }
                     //immm4 = pc + immm4 - 4;
                     rdid = 0;
@@ -793,7 +817,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             0b010 => {
                                 rval = image.load32(rsval);
                                 if DEBUG_INSTR {
-                                    println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
+                                    //println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
                                 }
                             }
                             0b100 => {
@@ -822,7 +846,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                         .wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
 
                     if DEBUG_INSTR {
-                        println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
+                        //println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
                     }
                     rdid = 0;
 
@@ -878,12 +902,12 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     let rs2 = if is_reg { state.reg(imm & 0x1f) } else { imm };
 
                     if DEBUG_INSTR {
-                        println!(
-                            "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
-                            rs1,
-                            rs2,
-                            if is_reg { 1 } else { 0 }
-                        );
+                        // println!(
+                        //     "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
+                        //     rs1,
+                        //     rs2,
+                        //     if is_reg { 1 } else { 0 }
+                        // );
                     }
 
                     if is_reg && (ir & 0x02000000 != 0) {
@@ -1054,7 +1078,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             //0xf14:  //mhartid
                             //0x301:  //misa
                             _default => {
-                                handler.othercsr_write(image, csrno, writeval);
+                                handler.othercsr_write(&image, csrno, writeval);
                             }
                         }
                     } else if microop == 0b000 {
