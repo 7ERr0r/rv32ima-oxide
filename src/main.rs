@@ -24,21 +24,21 @@ static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 // #define MINIRV32_POSTEXEC(...);
 
-fn MINIRV32_POSTEXEC(a: u32, b: u32, trap: u32) {}
+fn minirv32_postexec(_pc: u32, _ir: u32, _trap: u32) {}
 
 // #define MINIRV32_HANDLE_MEM_STORE_CONTROL(...);
 
-fn MINIRV32_HANDLE_MEM_STORE_CONTROL(a: u32, b: u32) {}
+fn minirv32_handle_mem_store_control(_addy: u32, _rs2: u32) {}
 
 // #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(...);
 
-fn MINIRV32_HANDLE_MEM_LOAD_CONTROL(a: u32, b: u32) {}
+fn minirv32_handle_mem_load_control(_rsval: u32, _rval: u32) {}
 
 // #define MINIRV32_OTHERCSR_WRITE(...);
-fn MINIRV32_OTHERCSR_WRITE(a: u32, b: u32) {}
+fn minirv32_othercsr_write(_csrno: u32, _writeval: u32) {}
 
 // #define MINIRV32_OTHERCSR_READ(...);
-fn MINIRV32_OTHERCSR_READ(a: u32, b: u32) {}
+fn minirv32_othercsr_read(_csrno: u32, _rval: u32) {}
 
 // #define MINIRV32_STORE4( ofs, val ) *(u32*)(image + ofs) = val
 // #define MINIRV32_STORE2( ofs, val ) *(u16*)(image + ofs) = val
@@ -93,12 +93,16 @@ pub struct RVImage {
 impl RVImage {
     pub fn load32(&self, offset: u32) -> u32 {
         let slice = &self.image[offset as usize..(offset + 4) as usize];
+
+        // Always safe, since slice above is checked
         <u32>::from_le_bytes(unsafe {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u32>()])
         })
     }
     pub fn load16(&self, offset: u32) -> u16 {
         let slice = &self.image[offset as usize..(offset + 2) as usize];
+
+        // Always safe, since slice above is checked
         <u16>::from_le_bytes(unsafe {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u16>()])
         })
@@ -130,14 +134,14 @@ impl RVImage {
 //     // )
 // }
 
-pub fn MiniRV32IMAStep(
+pub fn mini_rv32_ima_step(
     state: &mut MiniRV32IMAState,
     mut image: RVImage,
-    vProcAddress: u32,
-    elapsedUs: u32,
+    _v_proc_address: u32,
+    elapsed_us: u32,
     count: i32,
 ) -> i32 {
-    let new_timer: u32 = state.timerl + elapsedUs;
+    let new_timer: u32 = state.timerl + elapsed_us;
     if new_timer < state.timerl {
         state.timerh += 1;
     }
@@ -157,9 +161,8 @@ pub fn MiniRV32IMAStep(
     if (state.extraflags & 4) != 0 {
         return 1;
     }
-    let icount: i32;
 
-    for icount in 0..count {
+    for _icount in 0..count {
         let mut ir = 0;
         let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
         let mut rval = 0;
@@ -262,7 +265,6 @@ pub fn MiniRV32IMAStep(
                             trap = 2 + 1;
                         }
                     }
-                    break;
                 }
                 0b0000011 => {
                     // Load
@@ -276,16 +278,16 @@ pub fn MiniRV32IMAStep(
                     rsval -= MINIRV32_RAM_IMAGE_OFFSET;
                     if rsval >= MINI_RV32_RAM_SIZE - 3 {
                         rsval -= MINIRV32_RAM_IMAGE_OFFSET;
-                        if (rsval >= 0x10000000 && rsval < 0x12000000)
-                        // UART, CLNT
-                        {
+                        if rsval >= 0x10000000 && rsval < 0x12000000 {
+                            // UART, CLNT
+
                             if rsval == 0x1100bffc {
                                 // https://chromitem-soc.readthedocs.io/en/latest/clint.html
                                 rval = state.timerh;
                             } else if rsval == 0x1100bff8 {
                                 rval = state.timerl;
                             } else {
-                                MINIRV32_HANDLE_MEM_LOAD_CONTROL(rsval, rval);
+                                minirv32_handle_mem_load_control(rsval, rval);
                             }
                         } else {
                             trap = 5 + 1;
@@ -309,7 +311,7 @@ pub fn MiniRV32IMAStep(
                             0b101 => {
                                 rval = image.load16(rsval) as u32;
                             }
-                            default => {
+                            _default => {
                                 trap = 2 + 1;
                             }
                         }
@@ -327,26 +329,26 @@ pub fn MiniRV32IMAStep(
                     addy += rs1 - MINIRV32_RAM_IMAGE_OFFSET;
                     rdid = 0;
 
-                    if (addy >= MINI_RV32_RAM_SIZE - 3) {
+                    if addy >= MINI_RV32_RAM_SIZE - 3 {
                         addy -= MINIRV32_RAM_IMAGE_OFFSET;
-                        if (addy >= 0x10000000 && addy < 0x12000000) {
+                        if addy >= 0x10000000 && addy < 0x12000000 {
                             // Should be stuff like SYSCON, 8250, CLNT
-                            if (addy == 0x11004004) {
+                            if addy == 0x11004004 {
                                 //CLNT
                                 state.timermatchh = rs2;
-                            } else if (addy == 0x11004000) {
+                            } else if addy == 0x11004000 {
                                 //CLNT
                                 state.timermatchl = rs2;
-                            } else if (addy == 0x11100000) {
+                            } else if addy == 0x11100000 {
                                 //SYSCON (reboot, poweroff, etc.)
 
                                 state.pc = state.pc + 4;
                                 return rs2 as _; // NOTE: PC will be PC of Syscon.
                             } else {
-                                MINIRV32_HANDLE_MEM_STORE_CONTROL(addy, rs2);
+                                minirv32_handle_mem_store_control(addy, rs2);
                             }
                         } else {
-                            trap = (7 + 1); // Store access fault.
+                            trap = 7 + 1; // Store access fault.
                             rval = addy + MINIRV32_RAM_IMAGE_OFFSET;
                         }
                     } else {
@@ -366,7 +368,6 @@ pub fn MiniRV32IMAStep(
                             }
                         }
                     }
-                    break;
                 }
 
                 0b0110011 | 0b0010011 => {
@@ -462,7 +463,6 @@ pub fn MiniRV32IMAStep(
                             _default => {}
                         }
                     }
-                    break;
                 }
                 0b0001111 => {
                     rdid = 0; // fencetype = (ir >> 12) & 0b111; We ignore fences in this impl.
@@ -472,16 +472,16 @@ pub fn MiniRV32IMAStep(
 
                     let csrno = ir >> 20;
                     let microop = (ir >> 12) & 0b111;
-                    if ((microop & 3) != 0)
+                    if (microop & 3) != 0 {
                     // It's a Zicsr function.
-                    {
+                    
                         let rs1imm = (ir >> 15) & 0x1f;
                         let rs1 = state.reg(rs1imm);
                         let mut writeval = rs1;
 
                         // https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
                         // Generally, support for Zicsr
-                        match (csrno) {
+                        match csrno {
                             0x340 => rval = state.mscratch,
                             0x305 => rval = state.mtvec,
                             0x304 => rval = state.mie,
@@ -497,17 +497,17 @@ pub fn MiniRV32IMAStep(
                             0x301 => {
                                 rval = 0x40401101;
                             } //misa (XLEN=32, IMA+X)
-                            //0x3B0: rval = 0; break; //pmpaddr0
-                            //0x3a0: rval = 0; break; //pmpcfg0
-                            //0xf12: rval = 0x00000000; break; //marchid
-                            //0xf13: rval = 0x00000000; break; //mimpid
-                            //0xf14: rval = 0x00000000; break; //mhartid
+                            //0x3B0: rval = 0; //pmpaddr0
+                            //0x3a0: rval = 0; //pmpcfg0
+                            //0xf12: rval = 0x00000000; //marchid
+                            //0xf13: rval = 0x00000000; //mimpid
+                            //0xf14: rval = 0x00000000; //mhartid
                             _default => {
-                                MINIRV32_OTHERCSR_READ(csrno, rval);
+                                minirv32_othercsr_read(csrno, rval);
                             }
                         }
 
-                        match (microop) {
+                        match microop {
                             0b001 => {
                                 writeval = rs1;
                             } //CSRRW
@@ -529,7 +529,7 @@ pub fn MiniRV32IMAStep(
                             _default => {}
                         }
 
-                        match (csrno) {
+                        match csrno {
                             0x340 => state.mscratch = writeval,
                             0x305 => state.mtvec = writeval,
                             0x304 => state.mie = writeval,
@@ -538,31 +538,31 @@ pub fn MiniRV32IMAStep(
                             0x300 => state.mstatus = writeval, //mstatus
                             0x342 => state.mcause = writeval,
                             0x343 => state.mtval = writeval,
-                            //0x3a0: break; //pmpcfg0
-                            //0x3B0: break; //pmpaddr0
-                            //0xf11: break; //mvendorid
-                            //0xf12: break; //marchid
-                            //0xf13: break; //mimpid
-                            //0xf14: break; //mhartid
-                            //0x301: break; //misa
+                            //0x3a0:  //pmpcfg0
+                            //0x3B0:  //pmpaddr0
+                            //0xf11:  //mvendorid
+                            //0xf12:  //marchid
+                            //0xf13:  //mimpid
+                            //0xf14:  //mhartid
+                            //0x301:  //misa
                             _default => {
-                                MINIRV32_OTHERCSR_WRITE(csrno, writeval);
+                                minirv32_othercsr_write(csrno, writeval);
                             }
                         }
-                    } else if (microop == 0b000)
+                    } else if microop == 0b000 {
                     // "SYSTEM"
-                    {
+                    
                         rdid = 0;
-                        if (csrno == 0x105)
+                        if csrno == 0x105 {
                         //WFI (Wait for interrupts)
-                        {
+                        
                             state.mstatus |= 8; //Enable interrupts
                             state.extraflags |= 4; //Infor environment we want to go to sleep.
                             state.pc = pc + 4;
                             return 1;
-                        } else if ((csrno & 0xff) == 0x02)
+                        } else if (csrno & 0xff) == 0x02 {
                         // MRET
-                        {
+                        
                             //https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
                             //Table 7.6. MRET then in mstatus/mstatush sets MPV=0, MPP=0, MIE=MPIE, and MPIE=1. La
                             // Should also update mstatus to reflect correct mode.
@@ -575,24 +575,24 @@ pub fn MiniRV32IMAStep(
                             state.extraflags = newflags;
                             pc = state.mepc - 4;
                         } else {
-                            match (csrno) {
+                            match csrno {
                                 0 => {
                                     trap = if (state.extraflags & 3) != 0 {
-                                        (11 + 1)
+                                        11 + 1
                                     } else {
-                                        (8 + 1)
+                                        8 + 1
                                     };
                                 } // ECALL; 8 = "Environment call from U-mode"; 11 = "Environment call from M-mode"
                                 1 => {
-                                    trap = (3 + 1);
+                                    trap = 3 + 1;
                                 } // EBREAK 3 = "Breakpoint"
                                 _default => {
-                                    trap = (2 + 1);
+                                    trap = 2 + 1;
                                 } // Illegal opcode.
                             }
                         }
                     } else {
-                        trap = (2 + 1);
+                        trap = 2 + 1;
                     } // Note micrrop 0b100 == undefined.
                 }
                 0b0101111 => {
@@ -606,15 +606,15 @@ pub fn MiniRV32IMAStep(
 
                     // We don't implement load/store from UART or CLNT with RV32A here.
 
-                    if (rs1 >= MINI_RV32_RAM_SIZE - 3) {
-                        trap = (7 + 1); //Store/AMO access fault
+                    if rs1 >= MINI_RV32_RAM_SIZE - 3 {
+                        trap = 7 + 1; //Store/AMO access fault
                         rval = rs1 + MINIRV32_RAM_IMAGE_OFFSET;
                     } else {
                         rval = image.load32(rs1);
 
                         // Referenced a little bit of https://github.com/franzflasch/riscv_em/blob/master/src/core/core.c
                         let mut dowrite = true;
-                        match (irmid) {
+                        match irmid {
                             0b00010 => {
                                 dowrite = false;
                             } //LR.W
@@ -635,78 +635,77 @@ pub fn MiniRV32IMAStep(
                                 rs2 |= rval;
                             } //AMOOR.W
                             0b10000 => {
-                                rs2 = if ((rs2 as i32) < (rval as i32)) {
+                                rs2 = if (rs2 as i32) < (rval as i32) {
                                     rs2
                                 } else {
                                     rval
                                 }
                             } //AMOMIN.W
                             0b10100 => {
-                                rs2 = if ((rs2 as i32) > (rval as i32)) {
+                                rs2 = if (rs2 as i32) > (rval as i32) {
                                     rs2
                                 } else {
                                     rval
                                 }
                             } //AMOMAX.W
                             0b11000 => {
-                                rs2 = if (rs2 < rval) { rs2 } else { rval };
+                                rs2 = if rs2 < rval { rs2 } else { rval };
                             } //AMOMINU.W
                             0b11100 => {
-                                rs2 = if (rs2 > rval) { rs2 } else { rval };
+                                rs2 = if rs2 > rval { rs2 } else { rval };
                             } //AMOMAXU.W
                             _default => {
-                                trap = (2 + 1);
+                                trap = 2 + 1;
                                 dowrite = false;
                             } //Not supported.
                         }
-                        if (dowrite) {
+                        if dowrite {
                             image.store32(rs1, rs2);
                         }
                     }
-                    break;
                 }
                 _default => {
-                    trap = (2 + 1); // Fault: Invalid opcode.
+                    trap = 2 + 1; // Fault: Invalid opcode.
                 }
             }
 
-            if (trap == 0) {
-                if (rdid != 0) {
+            if trap == 0 {
+                if rdid != 0 {
                     state.regset(rdid, rval);
                 }
                 // Write back register.
-                else if ((state.mip & (1 << 7) != 0)
+                else if (state.mip & (1 << 7) != 0)
                     && (state.mie & (1 << 7) != 0/*mtie*/)
-                    && (state.mstatus & 0x8 != 0/*mie*/))
+                    && (state.mstatus & 0x8 != 0/*mie*/)
                 {
                     trap = 0x80000007; // Timer interrupt.
                 }
             }
         }
 
-        MINIRV32_POSTEXEC(pc, ir, trap);
+        minirv32_postexec(pc, ir, trap);
 
         // Handle traps and interrupts.
-        if (trap != 0) {
-            if (trap & 0x80000000 != 0)
-            // If prefixed with 0x100, it's an interrupt, not a trap.
-            {
+        if trap != 0 {
+            if trap & 0x80000000 != 0 {
+                // If prefixed with 0x100, it's an interrupt, not a trap.
+
                 state.mcause = trap;
                 state.mtval = 0;
                 pc += 4; // PC needs to point to where the PC will return to.
             } else {
                 state.mcause = trap - 1;
-                state.mtval = if (trap > 5 && trap <= 8) { rval } else { pc };
+                state.mtval = if trap > 5 && trap <= 8 { rval } else { pc };
             }
             state.mepc = pc; //TRICKY: The kernel advances mepc automatically.
                              //CSR( mstatus ) & 8 = MIE, & 0x80 = MPIE
                              // On an interrupt, the system moves current MIE into MPIE
             let newmstatus = ((state.mstatus & 0x08) << 4) | ((state.extraflags & 3) << 11);
             state.mstatus = newmstatus;
-            pc = (state.mtvec - 4);
+            pc = state.mtvec - 4;
 
             // XXX TODO: Do we actually want to check here? Is this correct?
-            if ((trap & 0x80000000) == 0) {
+            if (trap & 0x80000000) == 0 {
                 state.extraflags |= 3;
             }
         }
