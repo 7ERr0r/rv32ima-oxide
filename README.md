@@ -1,5 +1,10 @@
-Run
+rv32ima-oxide
 ===
+Copy-paste from https://github.com/cnlohr/mini-rv32ima into Rust
+
+
+# Run
+
 
 ```shell
 ./rv32ima-oxide$ cargo run
