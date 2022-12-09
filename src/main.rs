@@ -1,6 +1,6 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
 
-use std::{io::Write, num::Wrapping};
+use std::{io::Write, num::Wrapping, time::Duration};
 
 /*
     To use mini-rv32ima.h for the bare minimum, the following:
@@ -43,20 +43,19 @@ where
     }
 }
 
-static DEBUG_INSTR: bool = true;
+static DEBUG_INSTR: bool = false;
 
 pub fn main() {
-    let ram_amt: u32 = 64 * 1024 * 1024;
-    let mut instct: u64 = 0xffffffff as u64;
-    let show_help = 0;
+    let ram_amt: u32 = MINI_RV32_RAM_SIZE;
+    let mut instct: u64 = 13000_000_000 as u64;
+    //let show_help = 0;
     let time_divisor = 1;
-    let fixed_update = false;
+    let fixed_time_update = false;
     let do_sleep = true;
     let single_step = false;
 
-    let mut core: &mut MiniRV32IMAState;
+    
 
-    let dtb_ptr: u32 = 0;
     let mut ram_image = RVImage {
         image: vec![0; ram_amt as usize],
     };
@@ -68,6 +67,7 @@ pub fn main() {
     }
 
     let opt_dtb_bytes = Some(DEFAULT64MBDTB);
+    let mut dtb_ptr: u32 = 0;
     if let Some(dbt_bytes) = opt_dtb_bytes {
         //include_bytes!("sixtyfourmb.dtb");
         let dtb_len = dbt_bytes.len();
@@ -81,33 +81,39 @@ pub fn main() {
         // Update system ram size in DTB (but if and only if we're using the default DTB)
         // Warning - this will need to be updated if the skeleton DTB is ever modified.
         //let dtb_offset = (uint32_t*)(ram_image + dtb_ptr);
-        let value_offset = dtb_offset as u32 + 0x13c / 4;
+        let value_offset = dtb_offset as u32 + 0x13c;
         if ram_image.load32(value_offset) == 0x00c0ff03 {
-            //uint32_t validram = dtb_ptr;
             let validram = dtb_offset as u32;
-            let v = (validram >> 24)
-                | (((validram >> 16) & 0xff) << 8)
-                | (((validram >> 8) & 0xff) << 16)
-                | ((validram & 0xff) << 24);
-            ram_image.store32(value_offset, v);
+            ram_image.store32be(value_offset, validram);
         }
+        dtb_ptr = dtb_offset as u32;
     }
 
-    // The core lives at the end of RAM.
-    //core = (MiniRV32IMAState *)(ram_image + ram_amt - sizeof( struct MiniRV32IMAState ));
-    core = ref_core_last_bytes(&mut ram_image);
-    core.pc = MINIRV32_RAM_IMAGE_OFFSET;
-    core.regs[10] = 0x00; //hart ID
-    core.regs[11] = if dtb_ptr != 0 {
+    let mut handler = RVHandlerImpl::default();
+
+    let mut proc_state_obj;
+    let mut proc_state: &mut MiniRV32IMAState;
+    if true {
+        // The core lives on the heap
+        proc_state_obj = Box::new(MiniRV32IMAState::default());
+        proc_state = &mut proc_state_obj;
+    } else {
+        // The core lives at the end of RAM.
+        proc_state = ref_core_last_bytes(&mut ram_image);
+    }
+    let reg_a1_ram_size = if opt_dtb_bytes.is_some() {
         dtb_ptr + MINIRV32_RAM_IMAGE_OFFSET
     } else {
         0
-    }; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
-    core.extraflags |= 3; // Machine-mode.
+    };
+    proc_state.pc = MINIRV32_RAM_IMAGE_OFFSET;
+    proc_state.regs[10] = 0x00; //hart ID
+    proc_state.regs[11] = reg_a1_ram_size; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
+
+    proc_state.extraflags |= 3; // Machine-mode.
 
     // Image is loaded.
-
-    let mut last_time: u64 = if fixed_update {
+    let mut last_time: u64 = if fixed_time_update {
         0
     } else {
         time_now_micros() / time_divisor
@@ -115,21 +121,21 @@ pub fn main() {
     let instrs_per_flip = if single_step { 1 } else { 1024 };
     let mut rt: u64 = 0;
     while rt < instct + 1 {
-        //u64 * this_ccount = ((u64*)&core->cyclel);
         let elapsed_us: u64;
-        if fixed_update {
-            elapsed_us = core.cycle() / time_divisor - last_time;
+        if fixed_time_update {
+            elapsed_us = proc_state.cycle() / time_divisor - last_time;
         } else {
             elapsed_us = time_now_micros() / time_divisor - last_time;
         }
         last_time += elapsed_us;
 
         if single_step {
-            dump_state(&core, &ram_image, &ram_amt);
+            dump_state(&proc_state, &ram_image, &ram_amt);
         }
         let ret = mini_rv32_ima_step(
-            &mut core,
+            &mut proc_state,
             &mut ram_image,
+            &mut handler,
             0,
             elapsed_us as u32,
             instrs_per_flip,
@@ -139,8 +145,8 @@ pub fn main() {
             0 => {}
             1 => {
                 if do_sleep {
-                    //MiniSleep();
-                    core.set_cycle(core.cycle() + instrs_per_flip as u64);
+                    mini_sleep();
+                    proc_state.set_cycle(proc_state.cycle() + instrs_per_flip as u64);
                 }
             }
             3 => {
@@ -150,7 +156,7 @@ pub fn main() {
                 //goto restart;	//syscon code for restart
             }
             0x5555 => {
-                println!("POWEROFF@0x{:08x}0x{:08x}", core.cycleh, core.cyclel);
+                println!("POWEROFF@0x{:08x}0x{:08x}", proc_state.cycleh, proc_state.cyclel);
                 return; //syscon code for power-off
             }
             _default => {
@@ -163,28 +169,41 @@ pub fn main() {
     }
     println!("end of loop");
 
-    dump_state(&core, &ram_image, &ram_amt);
+    dump_state(&proc_state, &ram_image, &ram_amt);
 }
+
+
 
 pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     let pc = core.pc;
     let pc_offset = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
     let ir;
 
-    println!("PC: 0x{:08x} ", pc);
+    print!("PC: {:08x} ", pc);
     if pc_offset <= ram_amt - 4 {
         ir = image.load32(pc_offset);
-        println!("[0x{:08x}] ", ir);
+        print!("[0x{:08x}] ", ir);
     } else {
-        println!("[xxxxxxxxxx] ");
+        print!("[xxxxxxxxxx] ");
     }
     let regs = &core.regs;
-    println!( "Z:0x{:08x} ra:0x{:08x} sp:0x{:08x} gp:0x{:08x} tp:0x{:08x} t0:0x{:08x} t1:0x{:08x} t2:0x{:08x} s0:0x{:08x} s1:0x{:08x} a0:0x{:08x} a1:0x{:08x} a2:0x{:08x} a3:0x{:08x} a4:0x{:08x} a5:0x{:08x} ",
-		regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
-		regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15] );
-    println!( "a6:0x{:08x} a7:0x{:08x} s2:0x{:08x} s3:0x{:08x} s4:0x{:08x} s5:0x{:08x} s6:0x{:08x} s7:0x{:08x} s8:0x{:08x} s9:0x{:08x} s10:0x{:08x} s11:0x{:08x} t3:0x{:08x} t4:0x{:08x} t5:0x{:08x} t6:0x{:08x}\n",
-		regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
-		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
+    print!(
+        "Z:{:08x} ra:{:08x} sp:{:08x} gp:{:08x} tp:{:08x} t0:{:08x} t1:{:08x} t2:{:08x} ",
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+    );
+    print!(
+        "s0:{:08x} s1:{:08x} a0:{:08x} a1:{:08x} a2:{:08x} a3:{:08x} a4:{:08x} a5:{:08x} ",
+        regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15]
+    );
+
+    print!(
+        "a6:{:08x} a7:{:08x} s2:{:08x} s3:{:08x} s4:{:08x} s5:{:08x} s6:{:08x} s7:{:08x}",
+        regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
+    );
+    print!(
+        "s8:{:08x} s9:{:08x} s10:{:08x} s11:{:08x} t3:{:08x} t4:{:08x} t5:{:08x} t6:{:08x}\n",
+        regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31]
+    );
 }
 
 pub fn time_now_micros() -> u64 {
@@ -198,89 +217,134 @@ pub fn time_now_micros() -> u64 {
 static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
-fn minirv32_postexec(pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
-    minirv32_postexec_impl(pc, ir, retval)
+pub trait RVHandler {
+    fn postexec(&mut self, pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32>;
+    fn handle_mem_store_control(&mut self, addy: u32, rs2: u32) -> u32;
+    fn handle_mem_load_control(&mut self, addy: u32) -> u32;
+    fn othercsr_write(&mut self, image: &RVImage, csrno: u32, writeval: u32);
+    fn othercsr_read(&mut self, csrno: u32, rval: u32);
 }
-fn minirv32_postexec_impl(pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
-    let fail_on_all_faults = true;
-    if *retval > 0 {
-        if fail_on_all_faults {
-            println!("FAULT");
-            return Err(3);
-        } else {
-            //retval = retval;
-            //retval = HandleException(ir, retval);
+
+#[derive(Default)]
+pub struct RVHandlerImpl {
+    pub uart_buf: Vec<u8>,
+}
+
+impl RVHandlerImpl {
+    fn handle_exception(&mut self, _ir: u32, code: u32) -> u32 {
+        // Weird opcode emitted by duktape on exit.
+        if code == 3 {
+            // Could handle other opcodes here.
         }
+        code
     }
-    return Ok(0);
+    
 }
-fn minirv32_handle_mem_store_control(addy: u32, rs2: u32) {
-    handle_control_store_impl(addy, rs2);
-}
+impl RVHandler for RVHandlerImpl {
 
-fn minirv32_handle_mem_load_control(addy: u32, rval: &mut u32) {
-    *rval = handle_control_load_impl(addy);
-}
-
-fn minirv32_othercsr_write(image: &RVImage, csrno: u32, writeval: u32) {
-    handle_other_csr_write_impl(image, csrno as u16, writeval);
-}
-
-fn minirv32_othercsr_read(_csrno: u32, _rval: u32) {}
-
-fn handle_control_store_impl(addy: u32, val: u32) -> u32 {
-    if addy == 0x10000000
-    //UART 8250 / 16550 Data Buffer
-    {
-        std::io::stdout().write(&[val as u8]).unwrap();
-
-        std::io::stdout().flush().unwrap();
-        //fflush( stdout );
-    }
-    return 0;
-}
-
-fn handle_other_csr_write_impl(image: &RVImage, csrno: u16, value: u32) {
-    if csrno == 0x136 {
-        println!("{}", value);
-    }
-    if csrno == 0x137 {
-        println!("0x{:#08x}", value);
-    } else if csrno == 0x138 {
-        //Print "string"
-        let ptr_start = value.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-        let mut ptr_end = ptr_start;
-        let ram_amt = image.image.len() as u32;
-        if ptr_start >= ram_amt {
-            println!("DEBUG PASSED INVALID PTR (0x{:#08x})", value);
-        }
-        while let Some(&char) = image.image.get(ptr_end as usize) {
-            if char == 0 {
-                break;
+    fn postexec(&mut self, _pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
+        let fail_on_all_faults = false;
+        if *retval > 0 {
+            if fail_on_all_faults {
+                println!("FAULT retval: trap=={} (signed {})", retval, *retval as i32);
+                return Err(3);
+            } else {
+                //retval = retval;
+                *retval = self.handle_exception(ir, *retval);
             }
-            ptr_end += 1;
         }
-        if ptr_end != ptr_start {
-            let slice = &image.image[ptr_start as usize..ptr_end as usize];
-            let s = String::from_utf8_lossy(&slice);
-            println!("{}", s);
+        return Ok(0);
+    }
+
+    fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
+        if addy == 0x10000000 {
+            //UART 8250 / 16550 Data Buffer
+    
+            let character = val as u8;
+            self.uart_buf.push(character);
+            if character == '\n' as u8 {
+                let mut out = std::io::stdout();
+                out.write("uart: ".as_bytes()).unwrap();
+                out.write(&self.uart_buf).unwrap();
+                self.uart_buf.clear();
+            }
+    
+            // std::io::stdout().flush().unwrap();
+            //println!("UART: {}", val as u8 as char);
+            //fflush( stdout );
         }
+        return 0;
+    }
+
+    fn handle_mem_load_control(&mut self, addy: u32) -> u32 {
+        // Emulating a 8250 / 16550 UART
+        if addy == 0x10000005 {
+            let hitbit = if is_keyboard_hit() { 1 } else { 0 };
+            return 0x60 | hitbit;
+        } else if addy == 0x10000000 && is_keyboard_hit() {
+            return read_keyboard_byte();
+        }
+        return 0
+    }
+
+    fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
+        if csrno == 0x136 {
+            println!("{}", value);
+        }
+        if csrno == 0x137 {
+            println!("0x{:#08x}", value);
+        } else if csrno == 0x138 {
+            //Print "string"
+            let ptr_start = value.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
+            let mut ptr_end = ptr_start;
+            let ram_amt = image.image.len() as u32;
+            if ptr_start >= ram_amt {
+                println!("DEBUG PASSED INVALID PTR (0x{:#08x})", value);
+            }
+            while let Some(&char) = image.image.get(ptr_end as usize) {
+                if char == 0 {
+                    break;
+                }
+                ptr_end += 1;
+            }
+            if ptr_end != ptr_start {
+                let slice = &image.image[ptr_start as usize..ptr_end as usize];
+                let s = String::from_utf8_lossy(&slice);
+                println!("{}", s);
+            }
+        }
+    }
+
+    fn othercsr_read(&mut self, _csrno: u32, _rval: u32) {
+        
     }
 }
 
-fn handle_control_load_impl(addy: u32) -> u32 {
-    // Emulating a 8250 / 16550 UART
-    if addy == 0x10000005 {
-        let hitbit = if IsKBHit() { 1 } else { 0 };
-        return 0x60 | hitbit;
-    } else if addy == 0x10000000 && IsKBHit() {
-        return ReadKBByte();
-    }
-    return 0;
-}
+// fn minirv32_postexec(pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
+//     minirv32_postexec_impl(pc, ir, retval)
+// }
+
+// fn minirv32_handle_mem_store_control(addy: u32, rs2: u32) {
+//     handle_control_store_impl(addy, rs2);
+// }
+
+// fn minirv32_handle_mem_load_control(addy: u32, rval: &mut u32) {
+//     *rval = handle_control_load_impl(addy);
+// }
+
+// fn minirv32_othercsr_write(image: &RVImage, csrno: u32, writeval: u32) {
+//     handle_other_csr_write_impl(image, csrno as u16, writeval);
+// }
+
+
+
+
+
+
+
 
 static is_eofd: bool = false;
-fn ReadKBByte() -> u32 {
+fn read_keyboard_byte() -> u32 {
     if is_eofd {
         return 0xffffffff;
     }
@@ -295,7 +359,7 @@ fn ReadKBByte() -> u32 {
     }
 }
 
-fn IsKBHit() -> bool {
+fn is_keyboard_hit() -> bool {
     if is_eofd {
         return false;
     }
@@ -305,6 +369,10 @@ fn IsKBHit() -> bool {
     //return !!byteswaiting;
 
     false
+}
+
+fn mini_sleep() {
+    std::thread::sleep(Duration::from_micros(500));
 }
 
 // As a note: We quouple-ify these, because in HLSL, we will be operating with
@@ -390,6 +458,16 @@ impl RVImage {
             *ptr = val.to_le_bytes();
         };
     }
+    pub fn store32be(&mut self, offset: u32, val: u32) {
+        let ofs = offset as usize;
+        let slice = &mut self.image[ofs..ofs + 4];
+
+        // Always safe, since slice above is checked
+        unsafe {
+            let ptr = slice.as_mut_ptr() as *mut [u8; core::mem::size_of::<u32>()];
+            *ptr = val.to_be_bytes();
+        };
+    }
     pub fn store16(&mut self, offset: u32, val: u16) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 2];
@@ -405,9 +483,10 @@ impl RVImage {
     }
 }
 
-pub fn mini_rv32_ima_step(
+pub fn mini_rv32_ima_step<H: RVHandler>(
     state: &mut MiniRV32IMAState,
     image: &mut RVImage,
+    handler: &mut H,
     _v_proc_address: u32,
     elapsed_us: u32,
     count: u32,
@@ -453,7 +532,9 @@ pub fn mini_rv32_ima_step(
             trap = 1 + 0; //Handle PC-misaligned access
         } else {
             ir = image.load32(ofs_pc);
-            //println!("instruction: 0x{:08x}", ir);
+            if DEBUG_INSTR {
+                println!("IR 0x{:08x}", ir);
+            }
             let mut rdid: u32 = (ir >> 7) & 0x1f;
 
             match ir & 0x7f {
@@ -469,32 +550,39 @@ pub fn mini_rv32_ima_step(
                 0b1101111 => {
                     // JAL
 
-                    let mut reladdy: u32 = ((ir & 0x80000000) >> 11)
+                    let mut reladdy: i32 = (((ir & 0x80000000) >> 11)
                         | ((ir & 0x7fe00000) >> 20)
                         | ((ir & 0x00100000) >> 9)
-                        | (ir & 0x000ff000);
+                        | (ir & 0x000ff000)) as i32;
 
                     if DEBUG_INSTR {
-                        println!("JAL 0x{:08x}", reladdy);
+                        //println!("JAL 0x{:08x}", reladdy);
                     }
                     if reladdy & 0x00100000 != 0 {
-                        reladdy |= 0xffe00000; // Sign extension.
+                        reladdy |= 0xffe00000 as u32 as i32; // Sign extension.
                     }
                     rval = pc + 4;
                     //pc = pc + reladdy - 4;
-                    pc = pc.wrapping_add(reladdy).wrapping_sub(4);
+                    pc = (pc as i32 + reladdy as i32).wrapping_sub(4) as u32;
                 }
                 0b1100111 => {
                     // JALR
 
                     let imm: u32 = ir >> 20;
-                    let xx = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                    let imm_se: u32 = imm | xx;
+                    let extension = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm_se: i32 = (imm | extension) as i32;
                     rval = pc + 4;
-                    pc = ((state.reg((ir >> 15) & 0x1f).wrapping_add(imm_se)) & !1) - 4;
+                    let reg: i32 = state.reg((ir >> 15) & 0x1f) as i32;
+                    let new_pc: i32 = (reg.wrapping_add(imm_se)) & !1;
+                    pc = new_pc.wrapping_sub(4) as u32;
                 }
                 0b1100011 => {
                     // Branch
+                    // uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
+                    // if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
+                    // int32_t rs1 = REG((ir >> 15) & 0x1f);
+                    // int32_t rs2 = REG((ir >> 20) & 0x1f);
+                    // immm4 = pc + immm4 - 4;
 
                     let mut immm4: u32 = ((ir & 0xf00) >> 7)
                         | ((ir & 0x7e000000) >> 20)
@@ -503,9 +591,14 @@ pub fn mini_rv32_ima_step(
                     if immm4 & 0x1000 != 0 {
                         immm4 |= 0xffffe000;
                     }
-                    let rs1: u32 = state.reg((ir >> 15) & 0x1f);
-                    let rs2: u32 = state.reg((ir >> 20) & 0x1f);
+                    let rs1: i32 = state.reg((ir >> 15) & 0x1f) as i32;
+                    let rs2: i32 = state.reg((ir >> 20) & 0x1f) as i32;
+
                     immm4 = (Wrapping(pc) + Wrapping(immm4) - Wrapping(4)).0;
+
+                    if DEBUG_INSTR {
+                        println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
+                    }
                     //immm4 = pc + immm4 - 4;
                     rdid = 0;
                     match (ir >> 12) & 0x7 {
@@ -526,20 +619,23 @@ pub fn mini_rv32_ima_step(
                             }
                         }
                         0b101 => {
+                            //BGE
                             if rs1 >= rs2 {
                                 pc = immm4;
                             }
-                        } //BGE
+                        }
                         0b110 => {
+                            //BLTU
                             if (rs1 as u32) < rs2 as u32 {
                                 pc = immm4;
                             }
-                        } //BLTU
+                        }
                         0b111 => {
+                            //BGEU
                             if (rs1 as u32) >= rs2 as u32 {
                                 pc = immm4;
                             }
-                        } //BGEU
+                        }
                         _default => {
                             trap = 2 + 1;
                         }
@@ -550,11 +646,11 @@ pub fn mini_rv32_ima_step(
 
                     let rs1: u32 = state.reg((ir >> 15) & 0x1f);
                     let imm: u32 = ir >> 20;
-                    let xx = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                    let imm_se: u32 = imm | xx;
-                    let mut rsval: u32 = rs1.wrapping_add(imm_se);
+                    let extension: u32 = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm_se: i32 = (imm | extension) as i32;
+                    let mut rsval: u32 = (rs1 as i32).wrapping_add(imm_se) as u32;
 
-                    rsval -= MINIRV32_RAM_IMAGE_OFFSET;
+                    rsval = rsval.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
                     if rsval >= MINI_RV32_RAM_SIZE - 3 {
                         rsval -= MINIRV32_RAM_IMAGE_OFFSET;
                         if rsval >= 0x10000000 && rsval < 0x12000000 {
@@ -566,14 +662,14 @@ pub fn mini_rv32_ima_step(
                             } else if rsval == 0x1100bff8 {
                                 rval = state.timerl;
                             } else {
-                                minirv32_handle_mem_load_control(rsval, &mut rval);
+                                rval = handler.handle_mem_load_control(rsval);
                             }
                         } else {
                             trap = 5 + 1;
                             rval = rsval;
                         }
                     } else {
-                        match (ir >> 12) & 0x7 {
+                        match (ir >> 12) & 0b111 {
                             //LB, LH, LW, LBU, LHU
                             0b000 => {
                                 rval = image.load8(rsval) as i8 as u32;
@@ -583,6 +679,9 @@ pub fn mini_rv32_ima_step(
                             }
                             0b010 => {
                                 rval = image.load32(rsval);
+                                if DEBUG_INSTR {
+                                    println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
+                                }
                             }
                             0b100 => {
                                 rval = image.load8(rsval) as u32;
@@ -599,8 +698,8 @@ pub fn mini_rv32_ima_step(
                 0b0100011 => {
                     // Store
 
-                    let rs1: u32 = state.reg((ir >> 15) & 0x1f);
-                    let rs2: u32 = state.reg((ir >> 20) & 0x1f);
+                    let rs1: u32 = state.reg((ir >> 15) & 0b11111);
+                    let rs2: u32 = state.reg((ir >> 20) & 0b11111);
                     let mut addy: u32 = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
                     if addy & 0x800 != 0 {
                         addy |= 0xfffff000;
@@ -608,10 +707,14 @@ pub fn mini_rv32_ima_step(
                     addy = addy
                         .wrapping_add(rs1)
                         .wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
+
+                    if DEBUG_INSTR {
+                        println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
+                    }
                     rdid = 0;
 
-                    if addy >= MINI_RV32_RAM_SIZE - 3 {
-                        addy -= MINIRV32_RAM_IMAGE_OFFSET;
+                    if addy > MINI_RV32_RAM_SIZE - 4 {
+                        addy = addy.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
                         if addy >= 0x10000000 && addy < 0x12000000 {
                             // Should be stuff like SYSCON, 8250, CLNT
                             if addy == 0x11004004 {
@@ -626,14 +729,14 @@ pub fn mini_rv32_ima_step(
                                 state.pc = state.pc + 4;
                                 return Ok(rs2 as i32); // NOTE: PC will be PC of Syscon.
                             } else {
-                                minirv32_handle_mem_store_control(addy, rs2);
+                                handler.handle_mem_store_control(addy, rs2);
                             }
                         } else {
                             trap = 7 + 1; // Store access fault.
-                            rval = addy + MINIRV32_RAM_IMAGE_OFFSET;
+                            rval = addy.wrapping_add(MINIRV32_RAM_IMAGE_OFFSET);
                         }
                     } else {
-                        match (ir >> 12) & 0x7 {
+                        match (ir >> 12) & 0b111 {
                             //SB, SH, SW
                             0b000 => {
                                 image.store8(addy, rs2 as u8);
@@ -655,17 +758,26 @@ pub fn mini_rv32_ima_step(
                     // Op // Op-immediate
 
                     let imm = ir >> 20;
-                    let xx = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                    let imm = imm | xx;
+                    let extenstion = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm = imm | extenstion;
                     let rs1 = state.reg((ir >> 15) & 0x1f);
-                    let is_reg = ir & 0b100000 != 0;
+                    let is_reg = (ir & 0b100000) != 0;
                     let rs2 = if is_reg { state.reg(imm & 0x1f) } else { imm };
+
+                    if DEBUG_INSTR {
+                        println!(
+                            "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
+                            rs1,
+                            rs2,
+                            if is_reg { 1 } else { 0 }
+                        );
+                    }
 
                     if is_reg && (ir & 0x02000000 != 0) {
                         match (ir >> 12) & 7 {
                             //0x02000000 = RV32M
                             0b000 => {
-                                rval = rs1 * rs2;
+                                rval = rs1.wrapping_mul(rs2);
                             } // MUL
                             0b001 => {
                                 rval = (((rs1 as i32 as i64) * (rs2 as i32 as i64)) >> 32) as u32;
@@ -707,18 +819,18 @@ pub fn mini_rv32_ima_step(
                             _default => {}
                         }
                     } else {
-                        match (ir >> 12) & 7 {
+                        match (ir >> 12) & 0b111 {
                             // These could be either op-immediate or op commands.  Be careful.
                             0b000 => {
+                                // addi
                                 rval = if is_reg && (ir & 0x40000000) != 0 {
-                                    Wrapping(rs1) - Wrapping(rs2)
+                                    rs1.wrapping_sub(rs2)
                                 } else {
-                                    Wrapping(rs1) + Wrapping(rs2)
-                                }
-                                .0;
+                                    rs1.wrapping_add(rs2)
+                                };
                             }
                             0b001 => {
-                                rval = rs1 << rs2;
+                                rval = rs1.wrapping_shl(rs2);
                             }
                             0b010 => {
                                 rval = ((rs1 as i32) < (rs2 as i32)) as u32;
@@ -733,7 +845,7 @@ pub fn mini_rv32_ima_step(
                                 rval = if ir & 0x40000000 != 0 {
                                     ((rs1 as i32).wrapping_shr(rs2)) as u32
                                 } else {
-                                    rs1 >> rs2
+                                    rs1.wrapping_shr(rs2)
                                 };
                             }
                             0b110 => {
@@ -785,7 +897,7 @@ pub fn mini_rv32_ima_step(
                             //0xf13: rval = 0x00000000; //mimpid
                             //0xf14: rval = 0x00000000; //mhartid
                             _default => {
-                                minirv32_othercsr_read(csrno, rval);
+                                handler.othercsr_read(csrno, rval);
                             }
                         }
 
@@ -828,7 +940,7 @@ pub fn mini_rv32_ima_step(
                             //0xf14:  //mhartid
                             //0x301:  //misa
                             _default => {
-                                minirv32_othercsr_write(image, csrno, writeval);
+                                handler.othercsr_write(image, csrno, writeval);
                             }
                         }
                     } else if microop == 0b000 {
@@ -905,7 +1017,7 @@ pub fn mini_rv32_ima_step(
                             } //SC.W (Lie and always say it's good)
                             0b00001 => {} //AMOSWAP.W
                             0b00000 => {
-                                rs2 += rval;
+                                rs2 = rs2.wrapping_add(rval);
                             } //AMOADD.W
                             0b00100 => {
                                 rs2 ^= rval;
@@ -965,7 +1077,7 @@ pub fn mini_rv32_ima_step(
             }
         }
 
-        minirv32_postexec(pc, ir, &mut trap)?;
+        handler.postexec(pc, ir, &mut trap)?;
 
         // Handle traps and interrupts.
         if trap != 0 {
