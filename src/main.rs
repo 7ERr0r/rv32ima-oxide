@@ -18,7 +18,7 @@ static DEBUG_INSTR: bool = false;
 
 pub fn main() {
     let ram_amt: u32 = MINI_RV32_RAM_SIZE;
-    let mut instct: u64 = 46_700_000 as u64;
+    let mut instct: u64 = 4600_700_000 as u64;
     let time_divisor = 1;
     let fixed_time_update = false;
     let do_sleep = true;
