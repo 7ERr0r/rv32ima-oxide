@@ -1,6 +1,5 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
-
-use std::{time::Duration};
+// Modified by 7ERr0r and converted to Rust
 
 /*
     To use mini-rv32ima.h for the bare minimum, the following:
@@ -15,47 +14,17 @@ use std::{time::Duration};
         * Feel free to override any of the functionality with macros.
 */
 
-/// UNSAFE actually
-///
-/// returns another mutable pointer to the same memory
-///
-/// but memory there is just a bunch of u32 or u8 so who cares
-///
-/// ```
-/// // safe version                                                \/ - note lifetime here
-/// pub fn ref_core_last_bytes<'a>(ram_image: &'a mut RVImage) -> &'a mut MiniRV32IMAState {
-/// ```
-///
-pub fn ref_core_last_bytes<'a, 'b>(ram_image: &'a mut RVImage) -> &'b mut MiniRV32IMAState
-where
-    'b: 'a,
-{
-    let core_len = core::mem::size_of::<MiniRV32IMAState>();
-    let len = ram_image.image.len();
-    let offset = len - core_len;
-    let slice = &mut ram_image.image[offset..offset + core_len];
-
-    let ptr = slice.as_mut_ptr();
-    let ptr = ptr as *mut MiniRV32IMAState;
-    unsafe {
-        let ptr = ptr.as_mut().expect("*mut MiniRV32IMAState .as_mut()");
-        ptr
-    }
-}
-
 static DEBUG_INSTR: bool = false;
 
 pub fn main() {
     let ram_amt: u32 = MINI_RV32_RAM_SIZE;
     let mut instct: u64 = 46_700_000 as u64;
-    //let show_help = 0;
     let time_divisor = 1;
     let fixed_time_update = false;
     let do_sleep = true;
     let single_step = false;
 
     let mut image = vec![0; ram_amt as usize];
-
 
     {
         let file_image = include_bytes!("DownloadedImage");
@@ -66,22 +35,14 @@ pub fn main() {
     let opt_dtb_bytes = Some(DEFAULT64MBDTB);
     let mut dtb_ptr: u32 = 0;
     if let Some(dbt_bytes) = opt_dtb_bytes {
-        //include_bytes!("sixtyfourmb.dtb");
         let dtb_len = dbt_bytes.len();
         let core_len = core::mem::size_of::<MiniRV32IMAState>();
         let dtb_offset = ram_amt as usize - dtb_len - core_len;
         let im = &mut image[dtb_offset..dtb_offset + dtb_len];
         im.copy_from_slice(dbt_bytes);
-        // }
 
-        // if let Some(dbt_bytes) = opt_dtb_bytes {
-        // Update system ram size in DTB (but if and only if we're using the default DTB)
-        // Warning - this will need to be updated if the skeleton DTB is ever modified.
-        //let dtb_offset = (uint32_t*)(ram_image + dtb_ptr);
         let value_offset = dtb_offset as u32 + 0x13c;
-        let mut ram_image = RVImage {
-            image: &mut image,
-        };
+        let mut ram_image = RVImage { image: &mut image };
         if ram_image.load32(value_offset) == 0x00c0ff03 {
             let validram = dtb_offset as u32;
             ram_image.store32be(value_offset, validram);
@@ -91,19 +52,10 @@ pub fn main() {
 
     let mut handler = RVHandlerImpl::default();
 
-    let mut proc_state_obj;
-    let mut proc_state: &mut MiniRV32IMAState;
-    if true {
-        // The core lives on the heap
-        proc_state_obj = Box::new(MiniRV32IMAState::default());
-        proc_state = &mut proc_state_obj;
-    } else {
-        // The core lives at the end of RAM.
-        let mut ram_image = RVImage {
-            image: &mut image,
-        };
-        proc_state = ref_core_last_bytes(&mut ram_image);
-    }
+    // The core lives on the heap
+    let mut proc_state_obj = Box::new(MiniRV32IMAState::default());
+    let mut proc_state = &mut proc_state_obj;
+
     let reg_a1_ram_size = if opt_dtb_bytes.is_some() {
         dtb_ptr + MINIRV32_RAM_IMAGE_OFFSET
     } else {
@@ -114,8 +66,6 @@ pub fn main() {
     proc_state.regs[11] = reg_a1_ram_size; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
 
     proc_state.extraflags |= 3; // Machine-mode.
-
-
 
     // Image is loaded.
     let mut last_time: u64 = if fixed_time_update {
@@ -134,18 +84,12 @@ pub fn main() {
         }
         last_time += elapsed_us;
 
-        
-
         if single_step {
-            let mut ram_image = RVImage {
-                image: &mut image,
-            };
+            let mut ram_image = RVImage { image: &mut image };
             dump_state(&proc_state, &mut ram_image, &ram_amt);
         }
 
-        let ram_image = RVImage {
-            image: &mut image,
-        };
+        let ram_image = RVImage { image: &mut image };
         let ret = mini_rv32_ima_step(
             &mut proc_state,
             ram_image,
@@ -186,9 +130,7 @@ pub fn main() {
     }
     println!("end of loop");
 
-    let ram_image = RVImage {
-        image: &mut image,
-    };
+    let ram_image = RVImage { image: &mut image };
     dump_state(&proc_state, &ram_image, &ram_amt);
 }
 
@@ -282,8 +224,6 @@ impl RVHandlerImpl {
     }
 }
 impl RVHandler for RVHandlerImpl {
-
-    
     fn postexec(&mut self, _pc: u32, ir: u32, retval: u32) -> i32 {
         let fail_on_all_faults = false;
         if retval > 0 {
@@ -298,7 +238,6 @@ impl RVHandler for RVHandlerImpl {
         return 0;
     }
 
-    
     #[inline(never)]
     fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
         if addy == 0x10000000 {
@@ -360,22 +299,6 @@ impl RVHandler for RVHandlerImpl {
     fn othercsr_read(&mut self, _csrno: u32, _rval: u32) {}
 }
 
-// fn minirv32_postexec(pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
-//     minirv32_postexec_impl(pc, ir, retval)
-// }
-
-// fn minirv32_handle_mem_store_control(addy: u32, rs2: u32) {
-//     handle_control_store_impl(addy, rs2);
-// }
-
-// fn minirv32_handle_mem_load_control(addy: u32, rval: &mut u32) {
-//     *rval = handle_control_load_impl(addy);
-// }
-
-// fn minirv32_othercsr_write(image: &RVImage, csrno: u32, writeval: u32) {
-//     handle_other_csr_write_impl(image, csrno as u16, writeval);
-// }
-
 static IS_EOFD: bool = false;
 fn read_keyboard_byte() -> u32 {
     if IS_EOFD {
@@ -405,13 +328,8 @@ fn is_keyboard_hit() -> bool {
 }
 
 fn mini_sleep() {
-    std::thread::sleep(Duration::from_micros(100));
+    std::thread::sleep(std::time::Duration::from_micros(100));
 }
-
-// As a note: We quouple-ify these, because in HLSL, we will be operating with
-// uint4's.  We are going to uint4 data to/from system RAM.
-//
-// We're going to try to keep the full processor state to 12 x uint4.
 
 #[derive(Clone, Default)]
 pub struct MiniRV32IMAState {
@@ -1237,7 +1155,6 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     return 0;
 }
 
-
 #[inline(never)]
 fn rv32_handle_trap(state: &mut MiniRV32IMAState, trap: u32, pc: &mut u32, rval: u32) {
     if trap & 0x80000000 != 0 {
@@ -1262,7 +1179,6 @@ fn rv32_handle_trap(state: &mut MiniRV32IMAState, trap: u32, pc: &mut u32, rval:
         state.extraflags |= 3;
     }
 }
-
 
 static DEFAULT64MBDTB: &[u8] = &[
     0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x05, 0x00,
