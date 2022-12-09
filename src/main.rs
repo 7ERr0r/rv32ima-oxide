@@ -30,22 +30,34 @@ static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 	// #define MINIRV32_POSTEXEC(...);
 
+	fn MINIRV32_POSTEXEC(a: u32, b: u32, trap: u32) {
 
+	}
 
 	// #define MINIRV32_HANDLE_MEM_STORE_CONTROL(...);
 
+	fn MINIRV32_HANDLE_MEM_STORE_CONTROL(a: u32, b: u32) {
 
+	}
 
 	// #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(...);
+
+fn MINIRV32_HANDLE_MEM_LOAD_CONTROL(a: u32, b: u32) {
+
+}
 
 
 
 	// #define MINIRV32_OTHERCSR_WRITE(...);
+	fn MINIRV32_OTHERCSR_WRITE(a: u32, b: u32) {
 
+	}
 
 
 	// #define MINIRV32_OTHERCSR_READ(...);
+	fn MINIRV32_OTHERCSR_READ(a: u32, b: u32) {
 
+	}
 
 
 	// #define MINIRV32_STORE4( ofs, val ) *(u32*)(image + ofs) = val
@@ -91,7 +103,7 @@ impl MiniRV32IMAState {
 	pub fn reg(&self, reg_index: u32) -> u32 {
 		self.regs[reg_index as usize]
 	}
-	pub fn regset(&self, reg_index: u32, value: u32) {
+	pub fn regset(&mut self, reg_index: u32, value: u32) {
 		self.regs[reg_index as usize] = value
 	}
 }
@@ -177,7 +189,7 @@ pub fn MiniRV32IMAStep(state: &mut MiniRV32IMAState, image: RVImage, vProcAddres
     for icount in 0..count {
 
 		let ir = 0;
-		let trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
+		let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
 		let rval = 0;
 
 		// Increment both wall-clock and instruction count time.  (NOTE: Not strictly needed to run Linux)
