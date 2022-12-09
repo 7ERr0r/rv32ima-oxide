@@ -375,7 +375,7 @@ fn is_keyboard_hit() -> bool {
 }
 
 fn mini_sleep() {
-    std::thread::sleep(Duration::from_micros(500));
+    std::thread::sleep(Duration::from_micros(100));
 }
 
 // As a note: We quouple-ify these, because in HLSL, we will be operating with
@@ -451,7 +451,7 @@ impl RVImage {
             self.load32safe(offset)
         }
         #[cfg(not(debug_assertions))]
-        {
+        unsafe {
             self.load32unsafe(offset)
         }
     }
@@ -467,10 +467,9 @@ impl RVImage {
     }
 
     /// UNSAFE
-    pub fn load32unsafe(&self, offset: u32) -> u32 {
-        <u32>::from_le_bytes(unsafe {
-            *(self.image.as_ptr().add(offset as usize) as *const [u8; core::mem::size_of::<u32>()])
-        })
+    pub unsafe fn load32unsafe(&self, offset: u32) -> u32 {
+        let ptr = self.image.as_ptr().add(offset as usize) as *const u32;
+        *ptr
     }
 
     pub fn load16(&self, offset: u32) -> u16 {
@@ -479,7 +478,7 @@ impl RVImage {
             self.load16safe(offset)
         }
         #[cfg(not(debug_assertions))]
-        {
+        unsafe {
             self.load16unsafe(offset)
         }
     }
@@ -494,16 +493,40 @@ impl RVImage {
         })
     }
     /// UNSAFE
-    pub fn load16unsafe(&self, offset: u32) -> u16 {
-        <u16>::from_le_bytes(unsafe {
-            *(self.image.as_ptr().add(offset as usize) as *const [u8; core::mem::size_of::<u16>()])
-        })
+    pub unsafe fn load16unsafe(&self, offset: u32) -> u16 {
+        let ptr = self.image.as_ptr().add(offset as usize) as *const u16;
+        *ptr
     }
 
     pub fn load8(&self, offset: u32) -> u8 {
+        #[cfg(debug_assertions)]
+        {
+            self.load8safe(offset)
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            self.load8unsafe(offset)
+        }
+    }
+    pub fn load8safe(&self, offset: u32) -> u8 {
         self.image[offset as usize]
     }
+    pub unsafe fn load8unsafe(&self, offset: u32) -> u8 {
+        *self.image.as_ptr().add(offset as usize)
+    }
+
     pub fn store32(&mut self, offset: u32, val: u32) {
+        #[cfg(debug_assertions)]
+        {
+            self.store32safe(offset, val)
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            self.store32unsafe(offset, val)
+        }
+    }
+
+    pub fn store32safe(&mut self, offset: u32, val: u32) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 4];
 
@@ -513,6 +536,11 @@ impl RVImage {
             *ptr = val.to_le_bytes();
         };
     }
+    pub unsafe fn store32unsafe(&mut self, offset: u32, val: u32) {
+        let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u32;
+        *ptr = val;
+    }
+
     pub fn store32be(&mut self, offset: u32, val: u32) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 4];
@@ -523,7 +551,18 @@ impl RVImage {
             *ptr = val.to_be_bytes();
         };
     }
+
     pub fn store16(&mut self, offset: u32, val: u16) {
+        #[cfg(debug_assertions)]
+        {
+            self.store16safe(offset, val)
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            self.store16unsafe(offset, val)
+        }
+    }
+    pub fn store16safe(&mut self, offset: u32, val: u16) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 2];
 
@@ -533,8 +572,27 @@ impl RVImage {
             *ptr = val.to_le_bytes();
         };
     }
+
+    pub unsafe fn store16unsafe(&mut self, offset: u32, val: u16) {
+        let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u16;
+        *ptr = val;
+    }
+
     pub fn store8(&mut self, offset: u32, val: u8) {
+        #[cfg(debug_assertions)]
+        {
+            self.store8safe(offset, val)
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            self.store8unsafe(offset, val)
+        }
+    }
+    pub fn store8safe(&mut self, offset: u32, val: u8) {
         self.image[offset as usize] = val
+    }
+    pub unsafe fn store8unsafe(&mut self, offset: u32, val: u8) {
+        *self.image.as_mut_ptr().add(offset as usize) = val
     }
 }
 
