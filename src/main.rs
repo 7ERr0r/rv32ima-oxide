@@ -54,8 +54,6 @@ pub fn main() {
     let do_sleep = true;
     let single_step = false;
 
-    
-
     let mut ram_image = RVImage {
         image: vec![0; ram_amt as usize],
     };
@@ -156,7 +154,10 @@ pub fn main() {
                 //goto restart;	//syscon code for restart
             }
             0x5555 => {
-                println!("POWEROFF@0x{:08x}0x{:08x}", proc_state.cycleh, proc_state.cyclel);
+                println!(
+                    "POWEROFF@0x{:08x}0x{:08x}",
+                    proc_state.cycleh, proc_state.cyclel
+                );
                 return; //syscon code for power-off
             }
             _default => {
@@ -164,6 +165,7 @@ pub fn main() {
                 break;
             }
         }
+        handler.tick_stdout();
 
         rt += instrs_per_flip as u64;
     }
@@ -171,8 +173,6 @@ pub fn main() {
 
     dump_state(&proc_state, &ram_image, &ram_amt);
 }
-
-
 
 pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     let pc = core.pc;
@@ -228,6 +228,7 @@ pub trait RVHandler {
 #[derive(Default)]
 pub struct RVHandlerImpl {
     pub uart_buf: Vec<u8>,
+    pub uart_dirty_ticks: u8,
 }
 
 impl RVHandlerImpl {
@@ -238,10 +239,24 @@ impl RVHandlerImpl {
         }
         code
     }
-    
+    fn tick_stdout(&mut self) {
+        if self.uart_buf.len() > 0 {
+            self.uart_dirty_ticks += 1;
+            if self.uart_dirty_ticks > 250 {
+                self.uart_dirty_ticks = 0;
+                self.print_uart();
+            }
+        }
+    }
+    fn print_uart(&mut self) {
+        // let mut out = std::io::stdout();
+        // out.write("uart: ".as_bytes()).unwrap();
+        // out.write(&self.uart_buf).unwrap();
+        println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
+        self.uart_buf.clear();
+    }
 }
 impl RVHandler for RVHandlerImpl {
-
     fn postexec(&mut self, _pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
         let fail_on_all_faults = false;
         if *retval > 0 {
@@ -259,16 +274,13 @@ impl RVHandler for RVHandlerImpl {
     fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
         if addy == 0x10000000 {
             //UART 8250 / 16550 Data Buffer
-    
+
             let character = val as u8;
             self.uart_buf.push(character);
             if character == '\n' as u8 {
-                let mut out = std::io::stdout();
-                out.write("uart: ".as_bytes()).unwrap();
-                out.write(&self.uart_buf).unwrap();
-                self.uart_buf.clear();
+                self.print_uart();
             }
-    
+
             // std::io::stdout().flush().unwrap();
             //println!("UART: {}", val as u8 as char);
             //fflush( stdout );
@@ -284,7 +296,7 @@ impl RVHandler for RVHandlerImpl {
         } else if addy == 0x10000000 && is_keyboard_hit() {
             return read_keyboard_byte();
         }
-        return 0
+        return 0;
     }
 
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
@@ -315,9 +327,7 @@ impl RVHandler for RVHandlerImpl {
         }
     }
 
-    fn othercsr_read(&mut self, _csrno: u32, _rval: u32) {
-        
-    }
+    fn othercsr_read(&mut self, _csrno: u32, _rval: u32) {}
 }
 
 // fn minirv32_postexec(pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
@@ -335,13 +345,6 @@ impl RVHandler for RVHandlerImpl {
 // fn minirv32_othercsr_write(image: &RVImage, csrno: u32, writeval: u32) {
 //     handle_other_csr_write_impl(image, csrno as u16, writeval);
 // }
-
-
-
-
-
-
-
 
 static is_eofd: bool = false;
 fn read_keyboard_byte() -> u32 {
@@ -410,10 +413,25 @@ pub struct MiniRV32IMAState {
 }
 impl MiniRV32IMAState {
     pub fn reg(&self, reg_index: u32) -> u32 {
-        self.regs[reg_index as usize]
+        #[cfg(debug_assertions)]
+        {
+            self.regs[reg_index as usize]
+        }
+
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            *self.regs.get_unchecked(reg_index as usize)
+        }
     }
     pub fn regset(&mut self, reg_index: u32, value: u32) {
-        self.regs[reg_index as usize] = value
+        #[cfg(debug_assertions)]
+        {
+            self.regs[reg_index as usize] = value;
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            *self.regs.get_unchecked_mut(reg_index as usize) = value
+        }
     }
     pub fn cycle(&self) -> u64 {
         self.cyclel as u64
@@ -428,23 +446,60 @@ pub struct RVImage {
 }
 impl RVImage {
     pub fn load32(&self, offset: u32) -> u32 {
-        let ofs = offset as usize;
-        let slice = &self.image[ofs..ofs + 4];
+        #[cfg(debug_assertions)]
+        {
+            self.load32safe(offset)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.load32unsafe(offset)
+        }
+    }
 
-        // Always safe, since slice above is checked
+    /// Always safe, since slice above is checked
+    pub fn load32safe(&self, offset: u32) -> u32 {
+        let ofs = offset as usize;
+        let slice = &self.image[ofs..ofs + core::mem::size_of::<u32>()];
+
         <u32>::from_le_bytes(unsafe {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u32>()])
         })
     }
+
+    /// UNSAFE
+    pub fn load32unsafe(&self, offset: u32) -> u32 {
+        <u32>::from_le_bytes(unsafe {
+            *(self.image.as_ptr().add(offset as usize) as *const [u8; core::mem::size_of::<u32>()])
+        })
+    }
+
     pub fn load16(&self, offset: u32) -> u16 {
+        #[cfg(debug_assertions)]
+        {
+            self.load16safe(offset)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.load16unsafe(offset)
+        }
+    }
+
+    /// Always safe, since slice above is checked
+    pub fn load16safe(&self, offset: u32) -> u16 {
         let ofs = offset as usize;
         let slice = &self.image[ofs..ofs + 2];
 
-        // Always safe, since slice above is checked
         <u16>::from_le_bytes(unsafe {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u16>()])
         })
     }
+    /// UNSAFE
+    pub fn load16unsafe(&self, offset: u32) -> u16 {
+        <u16>::from_le_bytes(unsafe {
+            *(self.image.as_ptr().add(offset as usize) as *const [u8; core::mem::size_of::<u16>()])
+        })
+    }
+
     pub fn load8(&self, offset: u32) -> u8 {
         self.image[offset as usize]
     }
@@ -897,7 +952,8 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             //0xf13: rval = 0x00000000; //mimpid
                             //0xf14: rval = 0x00000000; //mhartid
                             _default => {
-                                handler.othercsr_read(csrno, rval);
+                                rval = 0;
+                                handler.othercsr_read(csrno, 0);
                             }
                         }
 
@@ -1004,7 +1060,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                         trap = 7 + 1; //Store/AMO access fault
                         rval = rs1 + MINIRV32_RAM_IMAGE_OFFSET;
                     } else {
-                        rval = image.load32(rs1);
+                        let mut temp = image.load32(rs1);
 
                         // Referenced a little bit of https://github.com/franzflasch/riscv_em/blob/master/src/core/core.c
                         let mut dowrite = true;
@@ -1013,46 +1069,47 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                 dowrite = false;
                             } //LR.W
                             0b00011 => {
-                                rval = 0;
+                                temp = 0;
                             } //SC.W (Lie and always say it's good)
                             0b00001 => {} //AMOSWAP.W
                             0b00000 => {
-                                rs2 = rs2.wrapping_add(rval);
+                                rs2 = rs2.wrapping_add(temp);
                             } //AMOADD.W
                             0b00100 => {
-                                rs2 ^= rval;
+                                rs2 ^= temp;
                             } //AMOXOR.W
                             0b01100 => {
-                                rs2 &= rval;
+                                rs2 &= temp;
                             } //AMOAND.W
                             0b01000 => {
-                                rs2 |= rval;
+                                rs2 |= temp;
                             } //AMOOR.W
                             0b10000 => {
-                                rs2 = if (rs2 as i32) < (rval as i32) {
+                                rs2 = if (rs2 as i32) < (temp as i32) {
                                     rs2
                                 } else {
-                                    rval
+                                    temp
                                 }
                             } //AMOMIN.W
                             0b10100 => {
-                                rs2 = if (rs2 as i32) > (rval as i32) {
+                                rs2 = if (rs2 as i32) > (temp as i32) {
                                     rs2
                                 } else {
-                                    rval
+                                    temp
                                 }
                             } //AMOMAX.W
                             0b11000 => {
-                                rs2 = if rs2 < rval { rs2 } else { rval };
+                                rs2 = if rs2 < temp { rs2 } else { temp };
                             } //AMOMINU.W
                             0b11100 => {
-                                rs2 = if rs2 > rval { rs2 } else { rval };
+                                rs2 = if rs2 > temp { rs2 } else { temp };
                             } //AMOMAXU.W
                             _default => {
                                 trap = 2 + 1;
                                 dowrite = false;
                             } //Not supported.
                         }
+                        rval = temp;
                         if dowrite {
                             image.store32(rs1, rs2);
                         }
