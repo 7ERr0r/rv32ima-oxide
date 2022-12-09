@@ -626,7 +626,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     handler: &mut H,
     _v_proc_address: u32,
     elapsed_us: u32,
-    count: u32,
+    count: u16,
 ) -> Result<i32, i32> {
     let new_timer: u32 = state.timerl + elapsed_us;
     if new_timer < state.timerl {
@@ -672,7 +672,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
             if DEBUG_INSTR {
                 //println!("IR 0x{:08x}", ir);
             }
-            let mut rdid: u32 = (ir >> 7) & 0x1f;
+            let mut rdid: u8 = ((ir >> 7) & 0x1f) as u8;
 
             match ir & 0x7f {
                 0b0110111 => {
@@ -731,7 +731,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     let rs1: i32 = state.reg((ir >> 15) & 0x1f) as i32;
                     let rs2: i32 = state.reg((ir >> 20) & 0x1f) as i32;
 
-                    immm4 = (Wrapping(pc) + Wrapping(immm4) - Wrapping(4)).0;
+                    immm4 = immm4.wrapping_add(pc).wrapping_sub(4);
 
                     if DEBUG_INSTR {
                         //println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
@@ -1204,7 +1204,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
 
             if trap == 0 {
                 if rdid != 0 {
-                    state.regset(rdid, rval);
+                    state.regset(rdid as u32, rval);
                 }
                 // Write back register.
                 else if (state.mip & (1 << 7) != 0)
