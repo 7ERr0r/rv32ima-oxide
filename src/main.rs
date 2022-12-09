@@ -1,6 +1,6 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
 
-use std::time::Duration;
+use std::{io::Write, num::Wrapping, time::Duration};
 
 /*
     To use mini-rv32ima.h for the bare minimum, the following:
@@ -47,17 +47,17 @@ static DEBUG_INSTR: bool = false;
 
 pub fn main() {
     let ram_amt: u32 = MINI_RV32_RAM_SIZE;
-    //let mut instct: u64 = 48_000_000 as u64;
-    let instr_count_limit: u64 = 46_700_000 as u64;
-    //let mut instct: u64 = 480000_000_000 as u64;
+    let mut instct: u64 = 13000_000_000 as u64;
     //let show_help = 0;
     let time_divisor = 1;
     let fixed_time_update = false;
     let do_sleep = true;
     let single_step = false;
 
-    let image = vec![0; ram_amt as usize];
-    let mut ram_image = RVImage { image: image };
+    let mut ram_image = RVImage {
+        image: vec![0; ram_amt as usize],
+    };
+
     {
         let file_image = include_bytes!("DownloadedImage");
         let im = &mut ram_image.image[..file_image.len()];
@@ -87,19 +87,18 @@ pub fn main() {
         dtb_ptr = dtb_offset as u32;
     }
 
-    let mut handler = RVHandlerImpl::new();
+    let mut handler = RVHandlerImpl::default();
 
-    let mut proc_state = MiniRV32IMAState::default();
-    //let mut proc_state_obj = Box::new(MiniRV32IMAState::default());
-    //let mut proc_state: &mut MiniRV32IMAState;
-    // if true {
-    //     // The core lives on the heap
-    //     proc_state_obj = Box::new(MiniRV32IMAState::default());
-    //     proc_state = &mut proc_state_obj;
-    // } else {
-    //     // The core lives at the end of RAM.
-    //     proc_state = ref_core_last_bytes(&mut ram_image);
-    // }
+    let mut proc_state_obj;
+    let mut proc_state: &mut MiniRV32IMAState;
+    if true {
+        // The core lives on the heap
+        proc_state_obj = Box::new(MiniRV32IMAState::default());
+        proc_state = &mut proc_state_obj;
+    } else {
+        // The core lives at the end of RAM.
+        proc_state = ref_core_last_bytes(&mut ram_image);
+    }
     let reg_a1_ram_size = if opt_dtb_bytes.is_some() {
         dtb_ptr + MINIRV32_RAM_IMAGE_OFFSET
     } else {
@@ -111,37 +110,7 @@ pub fn main() {
 
     proc_state.extraflags |= 3; // Machine-mode.
 
-    let mut emu = Box::new(RVEmulator {
-        handler,
-        image: ram_image,
-        state: proc_state,
-    });
-
     // Image is loaded.
-    emulator_loop(
-        &mut emu,
-        fixed_time_update,
-        single_step,
-        do_sleep,
-        time_divisor,
-        instr_count_limit,
-    );
-    println!("end of loop");
-
-    emu.handler.print_histogram();
-
-    dump_state(&emu.state, &emu.image);
-}
-
-#[inline(never)]
-fn emulator_loop<H: RVHandler>(
-    emu: &mut RVEmulator<H>,
-    fixed_time_update: bool,
-    single_step: bool,
-    do_sleep: bool,
-    time_divisor: u64,
-    instr_count_limit: u64,
-) {
     let mut last_time: u64 = if fixed_time_update {
         0
     } else {
@@ -149,34 +118,37 @@ fn emulator_loop<H: RVHandler>(
     };
     let instrs_per_flip = if single_step { 1 } else { 1024 };
     let mut rt: u64 = 0;
-    //let ram_image = RVImage { image: image };
-
-    while rt < instr_count_limit + 1 {
+    while rt < instct + 1 {
         let elapsed_us: u64;
         if fixed_time_update {
-            elapsed_us = emu.state.cycle() / time_divisor - last_time;
+            elapsed_us = proc_state.cycle() / time_divisor - last_time;
         } else {
             elapsed_us = time_now_micros() / time_divisor - last_time;
         }
         last_time += elapsed_us;
 
         if single_step {
-            dump_state(&emu.state, &emu.image);
+            dump_state(&proc_state, &ram_image, &ram_amt);
         }
-
-        let ret = mini_rv32_ima_step(emu, 0, elapsed_us as u32, instrs_per_flip); // Execute upto 1024 cycles before breaking out.
+        let ret = mini_rv32_ima_step(
+            &mut proc_state,
+            &mut ram_image,
+            &mut handler,
+            0,
+            elapsed_us as u32,
+            instrs_per_flip,
+        ); // Execute upto 1024 cycles before breaking out.
+        let ret = ret.unwrap_or_else(|ret| ret);
         match ret {
             0 => {}
             1 => {
                 if do_sleep {
-                    emu.handler.tick_stdout();
                     mini_sleep();
-                    emu.state
-                        .set_cycle(emu.state.cycle() + instrs_per_flip as u64);
+                    proc_state.set_cycle(proc_state.cycle() + instrs_per_flip as u64);
                 }
             }
             3 => {
-                //instr_count_limit = 0;
+                instct = 0;
             }
             0x7777 => {
                 //goto restart;	//syscon code for restart
@@ -184,7 +156,7 @@ fn emulator_loop<H: RVHandler>(
             0x5555 => {
                 println!(
                     "POWEROFF@0x{:08x}0x{:08x}",
-                    emu.state.cycleh, emu.state.cyclel
+                    proc_state.cycleh, proc_state.cyclel
                 );
                 return; //syscon code for power-off
             }
@@ -193,19 +165,22 @@ fn emulator_loop<H: RVHandler>(
                 break;
             }
         }
+        handler.tick_stdout();
 
         rt += instrs_per_flip as u64;
     }
+    println!("end of loop");
+
+    dump_state(&proc_state, &ram_image, &ram_amt);
 }
 
-#[inline(never)]
-pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage) {
+pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     let pc = core.pc;
     let pc_offset = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
     let ir;
 
     print!("PC: {:08x} ", pc);
-    if pc_offset <= image.len() as u32 - 4 {
+    if pc_offset <= ram_amt - 4 {
         ir = image.load32(pc_offset);
         print!("[0x{:08x}] ", ir);
     } else {
@@ -243,29 +218,20 @@ static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 pub trait RVHandler {
-    fn postexec(&mut self, pc: u32, ir: u32, retval: u32) -> i32;
+    fn postexec(&mut self, pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32>;
     fn handle_mem_store_control(&mut self, addy: u32, rs2: u32) -> u32;
     fn handle_mem_load_control(&mut self, addy: u32) -> u32;
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, writeval: u32);
     fn othercsr_read(&mut self, csrno: u32, rval: u32);
-    fn handle_opcode(&mut self, opcode: u8);
-    fn tick_stdout(&mut self);
 }
 
+#[derive(Default)]
 pub struct RVHandlerImpl {
     pub uart_buf: Vec<u8>,
     pub uart_dirty_ticks: u8,
-    pub opcode_histogram: Vec<u8>,
 }
 
 impl RVHandlerImpl {
-    fn new() -> Self {
-        Self {
-            uart_buf: Vec::with_capacity(2048),
-            uart_dirty_ticks: 0,
-            opcode_histogram: vec![0; 256],
-        }
-    }
     fn handle_exception(&mut self, _ir: u32, code: u32) -> u32 {
         // Weird opcode emitted by duktape on exit.
         if code == 3 {
@@ -273,40 +239,6 @@ impl RVHandlerImpl {
         }
         code
     }
-
-    #[inline(never)]
-    fn print_uart(&mut self) {
-        // {
-        //     use std::io::Write;
-        //     let mut out = std::io::stdout();
-        //     out.write("uart: ".as_bytes()).unwrap();
-        //     out.write(&self.uart_buf).unwrap();
-        // }
-        println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
-        self.uart_buf.clear();
-    }
-
-    /// Debug / stats
-    fn print_histogram(&mut self) {
-        if false {
-            for opcode in 0..0x7f {
-                let count = self.opcode_histogram[opcode];
-                println!("opcode {:02x} used {} times", opcode, count);
-            }
-        }
-    }
-
-    #[inline(never)]
-    fn postexec_fault(&mut self, retval: u32) {
-        println!("FAULT retval: trap=={} (signed {})", retval, retval as i32);
-    }
-}
-impl RVHandler for RVHandlerImpl {
-    /// Debug / stats
-    fn handle_opcode(&mut self, _opcode: u8) {
-        //self.opcode_histogram[opcode as usize] += 1;
-    }
-
     fn tick_stdout(&mut self) {
         if self.uart_buf.len() > 0 {
             self.uart_dirty_ticks += 1;
@@ -316,22 +248,29 @@ impl RVHandler for RVHandlerImpl {
             }
         }
     }
-
-    fn postexec(&mut self, _pc: u32, ir: u32, retval: u32) -> i32 {
+    fn print_uart(&mut self) {
+        // let mut out = std::io::stdout();
+        // out.write("uart: ".as_bytes()).unwrap();
+        // out.write(&self.uart_buf).unwrap();
+        println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
+        self.uart_buf.clear();
+    }
+}
+impl RVHandler for RVHandlerImpl {
+    fn postexec(&mut self, _pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
         let fail_on_all_faults = false;
-        if retval > 0 {
+        if *retval > 0 {
             if fail_on_all_faults {
-                self.postexec_fault(retval);
-                return 3;
+                println!("FAULT retval: trap=={} (signed {})", retval, *retval as i32);
+                return Err(3);
             } else {
                 //retval = retval;
-                self.handle_exception(ir, retval);
+                *retval = self.handle_exception(ir, *retval);
             }
         }
-        return 0;
+        return Ok(0);
     }
 
-    #[inline(never)]
     fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
         if addy == 0x10000000 {
             //UART 8250 / 16550 Data Buffer
@@ -360,7 +299,6 @@ impl RVHandler for RVHandlerImpl {
         return 0;
     }
 
-    #[inline(never)]
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
         if csrno == 0x136 {
             println!("{}", value);
@@ -475,24 +413,24 @@ pub struct MiniRV32IMAState {
 }
 impl MiniRV32IMAState {
     pub fn reg(&self, reg_index: u32) -> u32 {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.regs[reg_index as usize]
         }
 
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.as_ptr().add(reg_index as usize)
+            *self.regs.get_unchecked(reg_index as usize)
         }
     }
     pub fn regset(&mut self, reg_index: u32, value: u32) {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.regs[reg_index as usize] = value;
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.as_mut_ptr().add(reg_index as usize) = value
+            *self.regs.get_unchecked_mut(reg_index as usize) = value
         }
     }
     pub fn cycle(&self) -> u64 {
@@ -507,92 +445,88 @@ pub struct RVImage {
     image: Vec<u8>,
 }
 impl RVImage {
-    pub fn len(&self) -> usize {
-        self.image.len()
-    }
     pub fn load32(&self, offset: u32) -> u32 {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.load32safe(offset)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.load32unsafe(offset)
         }
     }
 
     /// Always safe, since slice above is checked
-    fn load32safe(&self, offset: u32) -> u32 {
+    pub fn load32safe(&self, offset: u32) -> u32 {
         let ofs = offset as usize;
-        let slice = &self.image[ofs..ofs + 4];
+        let slice = &self.image[ofs..ofs + core::mem::size_of::<u32>()];
 
-        <u32>::from_le_bytes(unsafe { *(slice.as_ptr() as *const [u8; 4]) })
+        <u32>::from_le_bytes(unsafe {
+            *(slice.as_ptr() as *const [u8; core::mem::size_of::<u32>()])
+        })
     }
 
-    #[allow(unused)]
     /// UNSAFE
-    unsafe fn load32unsafe(&self, offset: u32) -> u32 {
+    pub unsafe fn load32unsafe(&self, offset: u32) -> u32 {
         let ptr = self.image.as_ptr().add(offset as usize) as *const u32;
         *ptr
     }
 
     pub fn load16(&self, offset: u32) -> u16 {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.load16safe(offset)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.load16unsafe(offset)
         }
     }
 
     /// Always safe, since slice above is checked
-    fn load16safe(&self, offset: u32) -> u16 {
+    pub fn load16safe(&self, offset: u32) -> u16 {
         let ofs = offset as usize;
         let slice = &self.image[ofs..ofs + 2];
 
-        <u16>::from_le_bytes(unsafe { *(slice.as_ptr() as *const [u8; 2]) })
+        <u16>::from_le_bytes(unsafe {
+            *(slice.as_ptr() as *const [u8; core::mem::size_of::<u16>()])
+        })
     }
-
-    #[allow(unused)]
     /// UNSAFE
-    unsafe fn load16unsafe(&self, offset: u32) -> u16 {
+    pub unsafe fn load16unsafe(&self, offset: u32) -> u16 {
         let ptr = self.image.as_ptr().add(offset as usize) as *const u16;
         *ptr
     }
 
     pub fn load8(&self, offset: u32) -> u8 {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.load8safe(offset)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.load8unsafe(offset)
         }
     }
-    fn load8safe(&self, offset: u32) -> u8 {
+    pub fn load8safe(&self, offset: u32) -> u8 {
         self.image[offset as usize]
     }
-
-    #[allow(unused)]
-    unsafe fn load8unsafe(&self, offset: u32) -> u8 {
+    pub unsafe fn load8unsafe(&self, offset: u32) -> u8 {
         *self.image.as_ptr().add(offset as usize)
     }
 
     pub fn store32(&mut self, offset: u32, val: u32) {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.store32safe(offset, val)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.store32unsafe(offset, val)
         }
     }
 
-    fn store32safe(&mut self, offset: u32, val: u32) {
+    pub fn store32safe(&mut self, offset: u32, val: u32) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 4];
 
@@ -602,9 +536,7 @@ impl RVImage {
             *ptr = val.to_le_bytes();
         };
     }
-
-    #[allow(unused)]
-    unsafe fn store32unsafe(&mut self, offset: u32, val: u32) {
+    pub unsafe fn store32unsafe(&mut self, offset: u32, val: u32) {
         let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u32;
         *ptr = val;
     }
@@ -621,16 +553,16 @@ impl RVImage {
     }
 
     pub fn store16(&mut self, offset: u32, val: u16) {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.store16safe(offset, val)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.store16unsafe(offset, val)
         }
     }
-    fn store16safe(&mut self, offset: u32, val: u16) {
+    pub fn store16safe(&mut self, offset: u32, val: u16) {
         let ofs = offset as usize;
         let slice = &mut self.image[ofs..ofs + 2];
 
@@ -641,686 +573,655 @@ impl RVImage {
         };
     }
 
-    #[allow(unused)]
-    unsafe fn store16unsafe(&mut self, offset: u32, val: u16) {
+    pub unsafe fn store16unsafe(&mut self, offset: u32, val: u16) {
         let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u16;
         *ptr = val;
     }
 
     pub fn store8(&mut self, offset: u32, val: u8) {
-        #[cfg(not(feature = "unsafes"))]
+        #[cfg(debug_assertions)]
         {
             self.store8safe(offset, val)
         }
-        #[cfg(feature = "unsafes")]
+        #[cfg(not(debug_assertions))]
         unsafe {
             self.store8unsafe(offset, val)
         }
     }
-    fn store8safe(&mut self, offset: u32, val: u8) {
+    pub fn store8safe(&mut self, offset: u32, val: u8) {
         self.image[offset as usize] = val
     }
-    #[allow(unused)]
-    unsafe fn store8unsafe(&mut self, offset: u32, val: u8) {
+    pub unsafe fn store8unsafe(&mut self, offset: u32, val: u8) {
         *self.image.as_mut_ptr().add(offset as usize) = val
     }
 }
 
-pub struct RVEmulator<H: RVHandler> {
-    pub image: RVImage,
-    pub state: MiniRV32IMAState,
-    pub handler: H,
-}
-
-impl<H: RVHandler> RVEmulator<H> {}
-
-#[inline(never)]
 pub fn mini_rv32_ima_step<H: RVHandler>(
-    emu: &mut RVEmulator<H>,
+    state: &mut MiniRV32IMAState,
+    image: &mut RVImage,
+    handler: &mut H,
     _v_proc_address: u32,
     elapsed_us: u32,
-    count: u16,
-) -> i32 {
-    let new_timer: u32 = emu.state.timerl + elapsed_us;
-    if new_timer < emu.state.timerl {
-        emu.state.timerh += 1;
+    count: u32,
+) -> Result<i32, i32> {
+    let new_timer: u32 = state.timerl + elapsed_us;
+    if new_timer < state.timerl {
+        state.timerh += 1;
     }
-    emu.state.timerl = new_timer;
+    state.timerl = new_timer;
 
     // Handle Timer interrupt.
-    if (emu.state.timerh > emu.state.timermatchh
-        || (emu.state.timerh == emu.state.timermatchh && emu.state.timerl > emu.state.timermatchl))
-        && (emu.state.timermatchh != 0 || emu.state.timermatchl != 0)
+    if (state.timerh > state.timermatchh
+        || (state.timerh == state.timermatchh && state.timerl > state.timermatchl))
+        && (state.timermatchh != 0 || state.timermatchl != 0)
     {
-        emu.state.extraflags &= !4; // Clear WFI
-        emu.state.mip |= 1 << 7; //MTIP of MIP // https://stackoverflow.com/a/61916199/2926815  Fire interrupt.
+        state.extraflags &= !4; // Clear WFI
+        state.mip |= 1 << 7; //MTIP of MIP // https://stackoverflow.com/a/61916199/2926815  Fire interrupt.
     } else {
-        emu.state.mip &= !(1 << 7);
+        state.mip &= !(1 << 7);
     }
     // If WFI, don't run processor.
-    if (emu.state.extraflags & 4) != 0 {
-        return 1;
+    if (state.extraflags & 4) != 0 {
+        return Ok(1);
     }
 
     for _icount in 0..count {
-        let ret = mini_rv32_one_instruction(emu);
-        if ret != 0 {
-            return ret;
+        let mut ir = 0;
+        let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
+        let mut rval = 0;
+
+        // Increment both wall-clock and instruction count time.  (NOTE: Not strictly needed to run Linux)
+        state.cyclel += 1;
+        if state.cyclel == 0 {
+            state.cycleh += 1;
         }
-    }
-    return 0;
-}
 
-pub fn mini_rv32_one_instruction<'a, H: RVHandler>(emu: &mut RVEmulator<H>) -> i32 {
-    let mut ir = 0;
-    let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
-    let mut rval = 0;
+        let mut pc: u32 = state.pc;
+        let ofs_pc: u32 = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
 
-    // Increment both wall-clock and instruction count time.  (NOTE: Not strictly needed to run Linux)
-    emu.state.cyclel += 1;
-    if emu.state.cyclel == 0 {
-        emu.state.cycleh += 1;
-    }
-
-    let mut pc: u32 = emu.state.pc;
-    let ofs_pc: u32 = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-
-    if ofs_pc >= MINI_RV32_RAM_SIZE {
-        trap = 1 + 1; // Handle access violation on instruction read.
-    } else if ofs_pc & 3 != 0 {
-        trap = 1 + 0; //Handle PC-misaligned access
-    } else {
-        ir = emu.image.load32(ofs_pc);
-        if DEBUG_INSTR {
-            //println!("IR 0x{:08x}", ir);
-        }
-        let mut rdid: u8 = ((ir >> 7) & 0x1f) as u8;
-
-        //handler.handle_opcode((ir & 0x7f) as u8);
-        match ir & 0x7f {
-            0b0110111 => {
-                // LUI
-
-                rval = ir & 0xfffff000;
+        if ofs_pc >= MINI_RV32_RAM_SIZE {
+            trap = 1 + 1; // Handle access violation on instruction read.
+        } else if ofs_pc & 3 != 0 {
+            trap = 1 + 0; //Handle PC-misaligned access
+        } else {
+            ir = image.load32(ofs_pc);
+            if DEBUG_INSTR {
+                println!("IR 0x{:08x}", ir);
             }
-            0b0010111 => {
-                // AUIPC
-                rval = pc.wrapping_add(ir & 0xfffff000);
-            }
-            0b1101111 => {
-                // JAL
+            let mut rdid: u32 = (ir >> 7) & 0x1f;
 
-                let mut reladdy: i32 = (((ir & 0x80000000) >> 11)
-                    | ((ir & 0x7fe00000) >> 20)
-                    | ((ir & 0x00100000) >> 9)
-                    | (ir & 0x000ff000)) as i32;
+            match ir & 0x7f {
+                0b0110111 => {
+                    // LUI
 
-                if DEBUG_INSTR {
-                    //println!("JAL 0x{:08x}", reladdy);
+                    rval = ir & 0xfffff000;
                 }
-                if reladdy & 0x00100000 != 0 {
-                    reladdy |= 0xffe00000 as u32 as i32; // Sign extension.
+                0b0010111 => {
+                    // AUIPC
+                    rval = pc.wrapping_add(ir & 0xfffff000);
                 }
-                rval = pc + 4;
-                //pc = pc + reladdy - 4;
-                pc = (pc as i32 + reladdy as i32).wrapping_sub(4) as u32;
-            }
-            0b1100111 => {
-                // JALR
+                0b1101111 => {
+                    // JAL
 
-                let imm: u32 = ir >> 20;
-                let extension = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                let imm_se: i32 = (imm | extension) as i32;
-                rval = pc + 4;
-                let reg: i32 = emu.state.reg((ir >> 15) & 0x1f) as i32;
-                let new_pc: i32 = (reg.wrapping_add(imm_se)) & !1;
-                pc = new_pc.wrapping_sub(4) as u32;
-            }
-            0b1100011 => {
-                // Branch
-                // uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
-                // if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
-                // int32_t rs1 = REG((ir >> 15) & 0x1f);
-                // int32_t rs2 = REG((ir >> 20) & 0x1f);
-                // immm4 = pc + immm4 - 4;
+                    let mut reladdy: i32 = (((ir & 0x80000000) >> 11)
+                        | ((ir & 0x7fe00000) >> 20)
+                        | ((ir & 0x00100000) >> 9)
+                        | (ir & 0x000ff000)) as i32;
 
-                let mut immm4: u32 = ((ir & 0xf00) >> 7)
-                    | ((ir & 0x7e000000) >> 20)
-                    | ((ir & 0x80) << 4)
-                    | ((ir >> 31) << 12);
-                if immm4 & 0x1000 != 0 {
-                    immm4 |= 0xffffe000;
+                    if DEBUG_INSTR {
+                        //println!("JAL 0x{:08x}", reladdy);
+                    }
+                    if reladdy & 0x00100000 != 0 {
+                        reladdy |= 0xffe00000 as u32 as i32; // Sign extension.
+                    }
+                    rval = pc + 4;
+                    //pc = pc + reladdy - 4;
+                    pc = (pc as i32 + reladdy as i32).wrapping_sub(4) as u32;
                 }
-                let rs1: i32 = emu.state.reg((ir >> 15) & 0x1f) as i32;
-                let rs2: i32 = emu.state.reg((ir >> 20) & 0x1f) as i32;
+                0b1100111 => {
+                    // JALR
 
-                immm4 = immm4.wrapping_add(pc).wrapping_sub(4);
-
-                if DEBUG_INSTR {
-                    //println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
+                    let imm: u32 = ir >> 20;
+                    let extension = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm_se: i32 = (imm | extension) as i32;
+                    rval = pc + 4;
+                    let reg: i32 = state.reg((ir >> 15) & 0x1f) as i32;
+                    let new_pc: i32 = (reg.wrapping_add(imm_se)) & !1;
+                    pc = new_pc.wrapping_sub(4) as u32;
                 }
-                //immm4 = pc + immm4 - 4;
-                rdid = 0;
-                match (ir >> 12) & 0b111 {
-                    // BEQ, BNE, BLT, BGE, BLTU, BGEU
-                    0b000 => {
-                        if rs1 == rs2 {
-                            pc = immm4;
-                        }
+                0b1100011 => {
+                    // Branch
+                    // uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
+                    // if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
+                    // int32_t rs1 = REG((ir >> 15) & 0x1f);
+                    // int32_t rs2 = REG((ir >> 20) & 0x1f);
+                    // immm4 = pc + immm4 - 4;
+
+                    let mut immm4: u32 = ((ir & 0xf00) >> 7)
+                        | ((ir & 0x7e000000) >> 20)
+                        | ((ir & 0x80) << 4)
+                        | ((ir >> 31) << 12);
+                    if immm4 & 0x1000 != 0 {
+                        immm4 |= 0xffffe000;
                     }
-                    0b001 => {
-                        if rs1 != rs2 {
-                            pc = immm4;
-                        }
+                    let rs1: i32 = state.reg((ir >> 15) & 0x1f) as i32;
+                    let rs2: i32 = state.reg((ir >> 20) & 0x1f) as i32;
+
+                    immm4 = (Wrapping(pc) + Wrapping(immm4) - Wrapping(4)).0;
+
+                    if DEBUG_INSTR {
+                        println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
                     }
-                    0b100 => {
-                        if rs1 < rs2 {
-                            pc = immm4;
-                        }
-                    }
-                    0b101 => {
-                        //BGE
-                        if rs1 >= rs2 {
-                            pc = immm4;
-                        }
-                    }
-                    0b110 => {
-                        //BLTU
-                        if (rs1 as u32) < rs2 as u32 {
-                            pc = immm4;
-                        }
-                    }
-                    0b111 => {
-                        //BGEU
-                        if (rs1 as u32) >= rs2 as u32 {
-                            pc = immm4;
-                        }
-                    }
-                    _default => {
-                        trap = 2 + 1;
-                    }
-                }
-            }
-            0b0000011 => {
-                // Load
-
-                let rs1: u32 = emu.state.reg((ir >> 15) & 0x1f);
-                let imm: u32 = ir >> 20;
-                let extension: u32 = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                let imm_se: i32 = (imm | extension) as i32;
-                let mut rsval: u32 = (rs1 as i32).wrapping_add(imm_se) as u32;
-
-                rsval = rsval.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-                if rsval >= MINI_RV32_RAM_SIZE - 3 {
-                    rsval -= MINIRV32_RAM_IMAGE_OFFSET;
-                    if rsval >= 0x10000000 && rsval < 0x12000000 {
-                        // UART, CLNT
-
-                        if rsval == 0x1100bffc {
-                            // https://chromitem-soc.readthedocs.io/en/latest/clint.html
-                            rval = emu.state.timerh;
-                        } else if rsval == 0x1100bff8 {
-                            rval = emu.state.timerl;
-                        } else {
-                            rval = emu.handler.handle_mem_load_control(rsval);
-                        }
-                    } else {
-                        trap = 5 + 1;
-                        rval = rsval;
-                    }
-                } else {
-                    match (ir >> 12) & 0b111 {
-                        //LB, LH, LW, LBU, LHU
-                        0b000 => {
-                            rval = emu.image.load8(rsval) as i8 as u32;
-                        }
-                        0b001 => {
-                            rval = emu.image.load16(rsval) as i16 as u32;
-                        }
-                        0b010 => {
-                            rval = emu.image.load32(rsval);
-                            if DEBUG_INSTR {
-                                //println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
-                            }
-                        }
-                        0b100 => {
-                            rval = emu.image.load8(rsval) as u32;
-                        }
-                        0b101 => {
-                            rval = emu.image.load16(rsval) as u32;
-                        }
-                        _default => {
-                            trap = 2 + 1;
-                        }
-                    }
-                }
-            }
-            0b0100011 => {
-                // Store
-
-                let rs1: u32 = emu.state.reg((ir >> 15) & 0b11111);
-                let rs2: u32 = emu.state.reg((ir >> 20) & 0b11111);
-                let mut addy: u32 = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
-                if addy & 0x800 != 0 {
-                    addy |= 0xfffff000;
-                }
-                addy = addy
-                    .wrapping_add(rs1)
-                    .wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-
-                if DEBUG_INSTR {
-                    //println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
-                }
-                rdid = 0;
-
-                if addy > MINI_RV32_RAM_SIZE - 4 {
-                    addy = addy.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-                    if addy >= 0x10000000 && addy < 0x12000000 {
-                        // Should be stuff like SYSCON, 8250, CLNT
-                        if addy == 0x11004004 {
-                            //CLNT
-                            emu.state.timermatchh = rs2;
-                        } else if addy == 0x11004000 {
-                            //CLNT
-                            emu.state.timermatchl = rs2;
-                        } else if addy == 0x11100000 {
-                            //SYSCON (reboot, poweroff, etc.)
-
-                            emu.state.pc = emu.state.pc + 4;
-                            return rs2 as i32; // NOTE: PC will be PC of Syscon.
-                        } else {
-                            emu.handler.handle_mem_store_control(addy, rs2);
-                        }
-                    } else {
-                        trap = 7 + 1; // Store access fault.
-                        rval = addy.wrapping_add(MINIRV32_RAM_IMAGE_OFFSET);
-                    }
-                } else {
-                    match (ir >> 12) & 0b111 {
-                        //SB, SH, SW
-                        0b000 => {
-                            emu.image.store8(addy, rs2 as u8);
-                        }
-                        0b001 => {
-                            emu.image.store16(addy, rs2 as u16);
-                        }
-                        0b010 => {
-                            emu.image.store32(addy, rs2);
-                        }
-                        _default => {
-                            trap = 2 + 1;
-                        }
-                    }
-                }
-            }
-
-            0b0110011 | 0b0010011 => {
-                // Op // Op-immediate
-
-                let imm = ir >> 20;
-                let extenstion = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                let imm = imm | extenstion;
-                let rs1 = emu.state.reg((ir >> 15) & 0x1f);
-                let is_reg = (ir & 0b100000) != 0;
-                let rs2 = if is_reg {
-                    emu.state.reg(imm & 0x1f)
-                } else {
-                    imm
-                };
-
-                if DEBUG_INSTR {
-                    // println!(
-                    //     "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
-                    //     rs1,
-                    //     rs2,
-                    //     if is_reg { 1 } else { 0 }
-                    // );
-                }
-
-                if is_reg && (ir & 0x02000000 != 0) {
-                    match (ir >> 12) & 0b111 {
-                        //0x02000000 = RV32M
-                        0b000 => {
-                            rval = rs1.wrapping_mul(rs2);
-                        } // MUL
-                        0b001 => {
-                            rval = (((rs1 as i32 as i64) * (rs2 as i32 as i64)) >> 32) as u32;
-                        } // MULH
-                        0b010 => {
-                            rval = (((rs1 as i32 as i64) * (rs2 as u64 as i64)) >> 32) as u32;
-                        } // MULHSU
-                        0b011 => {
-                            rval = (((rs1 as u64) * (rs2 as u64)) >> 32) as u32;
-                        } // MULHU
-                        0b100 => {
-                            if rs2 == 0 {
-                                rval = -1 as i32 as u32;
-                            } else {
-                                rval = ((rs1 as i32) / (rs2 as i32)) as u32;
-                            }
-                        } // DIV
-                        0b101 => {
-                            if rs2 == 0 {
-                                rval = 0xffffffff;
-                            } else {
-                                rval = rs1 / rs2;
-                            }
-                        } // DIVU
-                        0b110 => {
-                            if rs2 == 0 {
-                                rval = rs1;
-                            } else {
-                                rval = ((rs1 as i32) % (rs2 as i32)) as u32;
-                            }
-                        } // REM
-                        0b111 => {
-                            if rs2 == 0 {
-                                rval = rs1;
-                            } else {
-                                rval = rs1 % rs2;
-                            }
-                        } // REMU
-                        _default => {}
-                    }
-                } else {
-                    match (ir >> 12) & 0b111 {
-                        // These could be either op-immediate or op commands.  Be careful.
-                        0b000 => {
-                            // addi
-                            rval = if is_reg && (ir & 0x40000000) != 0 {
-                                rs1.wrapping_sub(rs2)
-                            } else {
-                                rs1.wrapping_add(rs2)
-                            };
-                        }
-                        0b001 => {
-                            rval = rs1.wrapping_shl(rs2);
-                        }
-                        0b010 => {
-                            rval = ((rs1 as i32) < (rs2 as i32)) as u32;
-                        }
-                        0b011 => {
-                            rval = (rs1 < rs2) as u32;
-                        }
-                        0b100 => {
-                            rval = rs1 ^ rs2;
-                        }
-                        0b101 => {
-                            rval = if ir & 0x40000000 != 0 {
-                                ((rs1 as i32).wrapping_shr(rs2)) as u32
-                            } else {
-                                rs1.wrapping_shr(rs2)
-                            };
-                        }
-                        0b110 => {
-                            rval = rs1 | rs2;
-                        }
-                        0b111 => {
-                            rval = rs1 & rs2;
-                        }
-                        _default => {}
-                    }
-                }
-            }
-            0b0001111 => {
-                rdid = 0; // fencetype = (ir >> 12) & 0b111; We ignore fences in this impl.
-            }
-            0b1110011 => {
-                // Zifencei+Zicsr
-
-                let csrno = ir >> 20;
-                let microop = (ir >> 12) & 0b111;
-                if (microop & 3) != 0 {
-                    // It's a Zicsr function.
-
-                    let rs1imm = (ir >> 15) & 0x1f;
-                    let rs1 = emu.state.reg(rs1imm);
-                    let mut writeval = rs1;
-
-                    // https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
-                    // Generally, support for Zicsr
-                    match csrno {
-                        0x340 => rval = emu.state.mscratch,
-                        0x305 => rval = emu.state.mtvec,
-                        0x304 => rval = emu.state.mie,
-                        0xC00 => rval = emu.state.cyclel,
-                        0x344 => rval = emu.state.mip,
-                        0x341 => rval = emu.state.mepc,
-                        0x300 => rval = emu.state.mstatus, //mstatus
-                        0x342 => rval = emu.state.mcause,
-                        0x343 => rval = emu.state.mtval,
-                        0xf11 => {
-                            rval = 0xff0ff0ff;
-                        } //mvendorid
-                        0x301 => {
-                            rval = 0x40401101;
-                        } //misa (XLEN=32, IMA+X)
-                        //0x3B0: rval = 0; //pmpaddr0
-                        //0x3a0: rval = 0; //pmpcfg0
-                        //0xf12: rval = 0x00000000; //marchid
-                        //0xf13: rval = 0x00000000; //mimpid
-                        //0xf14: rval = 0x00000000; //mhartid
-                        _default => {
-                            rval = 0;
-                            emu.handler.othercsr_read(csrno, 0);
-                        }
-                    }
-
-                    match microop {
-                        0b001 => {
-                            writeval = rs1;
-                        } //CSRRW
-                        0b010 => {
-                            writeval = rval | rs1;
-                        } //CSRRS
-                        0b011 => {
-                            writeval = rval & !rs1;
-                        } //CSRRC
-                        0b101 => {
-                            writeval = rs1imm;
-                        } //CSRRWI
-                        0b110 => {
-                            writeval = rval | rs1imm;
-                        } //CSRRSI
-                        0b111 => {
-                            writeval = rval & !rs1imm;
-                        } //CSRRCI
-                        _default => {}
-                    }
-
-                    match csrno {
-                        0x340 => emu.state.mscratch = writeval,
-                        0x305 => emu.state.mtvec = writeval,
-                        0x304 => emu.state.mie = writeval,
-                        0x344 => emu.state.mip = writeval,
-                        0x341 => emu.state.mepc = writeval,
-                        0x300 => emu.state.mstatus = writeval, //mstatus
-                        0x342 => emu.state.mcause = writeval,
-                        0x343 => emu.state.mtval = writeval,
-                        //0x3a0:  //pmpcfg0
-                        //0x3B0:  //pmpaddr0
-                        //0xf11:  //mvendorid
-                        //0xf12:  //marchid
-                        //0xf13:  //mimpid
-                        //0xf14:  //mhartid
-                        //0x301:  //misa
-                        _default => {
-                            emu.handler.othercsr_write(&emu.image, csrno, writeval);
-                        }
-                    }
-                } else if microop == 0b000 {
-                    // "SYSTEM"
-
+                    //immm4 = pc + immm4 - 4;
                     rdid = 0;
-                    if csrno == 0x105 {
-                        //WFI (Wait for interrupts)
+                    match (ir >> 12) & 0x7 {
+                        // BEQ, BNE, BLT, BGE, BLTU, BGEU
+                        0b000 => {
+                            if rs1 == rs2 {
+                                pc = immm4;
+                            }
+                        }
+                        0b001 => {
+                            if rs1 != rs2 {
+                                pc = immm4;
+                            }
+                        }
+                        0b100 => {
+                            if rs1 < rs2 {
+                                pc = immm4;
+                            }
+                        }
+                        0b101 => {
+                            //BGE
+                            if rs1 >= rs2 {
+                                pc = immm4;
+                            }
+                        }
+                        0b110 => {
+                            //BLTU
+                            if (rs1 as u32) < rs2 as u32 {
+                                pc = immm4;
+                            }
+                        }
+                        0b111 => {
+                            //BGEU
+                            if (rs1 as u32) >= rs2 as u32 {
+                                pc = immm4;
+                            }
+                        }
+                        _default => {
+                            trap = 2 + 1;
+                        }
+                    }
+                }
+                0b0000011 => {
+                    // Load
 
-                        emu.state.mstatus |= 8; //Enable interrupts
-                        emu.state.extraflags |= 4; //Inform environment we want to go to sleep.
-                        emu.state.pc = pc + 4;
-                        return 1;
-                    } else if (csrno & 0xff) == 0x02 {
-                        // MRET
+                    let rs1: u32 = state.reg((ir >> 15) & 0x1f);
+                    let imm: u32 = ir >> 20;
+                    let extension: u32 = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm_se: i32 = (imm | extension) as i32;
+                    let mut rsval: u32 = (rs1 as i32).wrapping_add(imm_se) as u32;
 
-                        //https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
-                        //Table 7.6. MRET then in mstatus/mstatush sets MPV=0, MPP=0, MIE=MPIE, and MPIE=1. La
-                        // Should also update mstatus to reflect correct mode.
-                        let startmstatus = emu.state.mstatus;
-                        let startextraflags = emu.state.extraflags;
-                        let newstatus =
-                            ((startmstatus & 0x80) >> 4) | ((startextraflags & 3) << 11) | 0x80;
-                        emu.state.mstatus = newstatus;
-                        let newflags = (startextraflags & !3) | ((startmstatus >> 11) & 3);
-                        emu.state.extraflags = newflags;
-                        pc = emu.state.mepc - 4;
+                    rsval = rsval.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
+                    if rsval >= MINI_RV32_RAM_SIZE - 3 {
+                        rsval -= MINIRV32_RAM_IMAGE_OFFSET;
+                        if rsval >= 0x10000000 && rsval < 0x12000000 {
+                            // UART, CLNT
+
+                            if rsval == 0x1100bffc {
+                                // https://chromitem-soc.readthedocs.io/en/latest/clint.html
+                                rval = state.timerh;
+                            } else if rsval == 0x1100bff8 {
+                                rval = state.timerl;
+                            } else {
+                                rval = handler.handle_mem_load_control(rsval);
+                            }
+                        } else {
+                            trap = 5 + 1;
+                            rval = rsval;
+                        }
                     } else {
-                        match csrno {
-                            0 => {
-                                trap = if (emu.state.extraflags & 3) != 0 {
-                                    11 + 1
-                                } else {
-                                    8 + 1
-                                };
-                            } // ECALL; 8 = "Environment call from U-mode"; 11 = "Environment call from M-mode"
-                            1 => {
-                                trap = 3 + 1;
-                            } // EBREAK 3 = "Breakpoint"
+                        match (ir >> 12) & 0b111 {
+                            //LB, LH, LW, LBU, LHU
+                            0b000 => {
+                                rval = image.load8(rsval) as i8 as u32;
+                            }
+                            0b001 => {
+                                rval = image.load16(rsval) as i16 as u32;
+                            }
+                            0b010 => {
+                                rval = image.load32(rsval);
+                                if DEBUG_INSTR {
+                                    println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
+                                }
+                            }
+                            0b100 => {
+                                rval = image.load8(rsval) as u32;
+                            }
+                            0b101 => {
+                                rval = image.load16(rsval) as u32;
+                            }
                             _default => {
                                 trap = 2 + 1;
-                            } // Illegal opcode.
+                            }
                         }
                     }
-                } else {
-                    trap = 2 + 1;
-                } // Note micrrop 0b100 == undefined.
-            }
-            0b0101111 => {
-                // RV32A
+                }
+                0b0100011 => {
+                    // Store
 
-                let mut rs1 = emu.state.reg((ir >> 15) & 0x1f);
-                let mut rs2 = emu.state.reg((ir >> 20) & 0x1f);
-                let irmid = (ir >> 27) & 0x1f;
-
-                rs1 -= MINIRV32_RAM_IMAGE_OFFSET;
-
-                // We don't implement load/store from UART or CLNT with RV32A here.
-
-                if rs1 >= MINI_RV32_RAM_SIZE - 3 {
-                    trap = 7 + 1; //Store/AMO access fault
-                    rval = rs1 + MINIRV32_RAM_IMAGE_OFFSET;
-                } else {
-                    let mut temp = emu.image.load32(rs1);
-
-                    // Referenced a little bit of https://github.com/franzflasch/riscv_em/blob/master/src/core/core.c
-                    let mut dowrite = true;
-                    match irmid {
-                        0b00010 => {
-                            dowrite = false;
-                        } //LR.W
-                        0b00011 => {
-                            temp = 0;
-                        } //SC.W (Lie and always say it's good)
-                        0b00001 => {} //AMOSWAP.W
-                        0b00000 => {
-                            rs2 = rs2.wrapping_add(temp);
-                        } //AMOADD.W
-                        0b00100 => {
-                            rs2 ^= temp;
-                        } //AMOXOR.W
-                        0b01100 => {
-                            rs2 &= temp;
-                        } //AMOAND.W
-                        0b01000 => {
-                            rs2 |= temp;
-                        } //AMOOR.W
-                        0b10000 => {
-                            rs2 = if (rs2 as i32) < (temp as i32) {
-                                rs2
-                            } else {
-                                temp
-                            }
-                        } //AMOMIN.W
-                        0b10100 => {
-                            rs2 = if (rs2 as i32) > (temp as i32) {
-                                rs2
-                            } else {
-                                temp
-                            }
-                        } //AMOMAX.W
-                        0b11000 => {
-                            rs2 = if rs2 < temp { rs2 } else { temp };
-                        } //AMOMINU.W
-                        0b11100 => {
-                            rs2 = if rs2 > temp { rs2 } else { temp };
-                        } //AMOMAXU.W
-                        _default => {
-                            trap = 2 + 1;
-                            dowrite = false;
-                        } //Not supported.
+                    let rs1: u32 = state.reg((ir >> 15) & 0b11111);
+                    let rs2: u32 = state.reg((ir >> 20) & 0b11111);
+                    let mut addy: u32 = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
+                    if addy & 0x800 != 0 {
+                        addy |= 0xfffff000;
                     }
-                    rval = temp;
-                    if dowrite {
-                        emu.image.store32(rs1, rs2);
+                    addy = addy
+                        .wrapping_add(rs1)
+                        .wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
+
+                    if DEBUG_INSTR {
+                        println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
+                    }
+                    rdid = 0;
+
+                    if addy > MINI_RV32_RAM_SIZE - 4 {
+                        addy = addy.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
+                        if addy >= 0x10000000 && addy < 0x12000000 {
+                            // Should be stuff like SYSCON, 8250, CLNT
+                            if addy == 0x11004004 {
+                                //CLNT
+                                state.timermatchh = rs2;
+                            } else if addy == 0x11004000 {
+                                //CLNT
+                                state.timermatchl = rs2;
+                            } else if addy == 0x11100000 {
+                                //SYSCON (reboot, poweroff, etc.)
+
+                                state.pc = state.pc + 4;
+                                return Ok(rs2 as i32); // NOTE: PC will be PC of Syscon.
+                            } else {
+                                handler.handle_mem_store_control(addy, rs2);
+                            }
+                        } else {
+                            trap = 7 + 1; // Store access fault.
+                            rval = addy.wrapping_add(MINIRV32_RAM_IMAGE_OFFSET);
+                        }
+                    } else {
+                        match (ir >> 12) & 0b111 {
+                            //SB, SH, SW
+                            0b000 => {
+                                image.store8(addy, rs2 as u8);
+                            }
+                            0b001 => {
+                                image.store16(addy, rs2 as u16);
+                            }
+                            0b010 => {
+                                image.store32(addy, rs2);
+                            }
+                            _default => {
+                                trap = 2 + 1;
+                            }
+                        }
                     }
                 }
+
+                0b0110011 | 0b0010011 => {
+                    // Op // Op-immediate
+
+                    let imm = ir >> 20;
+                    let extenstion = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
+                    let imm = imm | extenstion;
+                    let rs1 = state.reg((ir >> 15) & 0x1f);
+                    let is_reg = (ir & 0b100000) != 0;
+                    let rs2 = if is_reg { state.reg(imm & 0x1f) } else { imm };
+
+                    if DEBUG_INSTR {
+                        println!(
+                            "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
+                            rs1,
+                            rs2,
+                            if is_reg { 1 } else { 0 }
+                        );
+                    }
+
+                    if is_reg && (ir & 0x02000000 != 0) {
+                        match (ir >> 12) & 7 {
+                            //0x02000000 = RV32M
+                            0b000 => {
+                                rval = rs1.wrapping_mul(rs2);
+                            } // MUL
+                            0b001 => {
+                                rval = (((rs1 as i32 as i64) * (rs2 as i32 as i64)) >> 32) as u32;
+                            } // MULH
+                            0b010 => {
+                                rval = (((rs1 as i32 as i64) * (rs2 as u64 as i64)) >> 32) as u32;
+                            } // MULHSU
+                            0b011 => {
+                                rval = (((rs1 as u64) * (rs2 as u64)) >> 32) as u32;
+                            } // MULHU
+                            0b100 => {
+                                if rs2 == 0 {
+                                    rval = -1 as i32 as u32;
+                                } else {
+                                    rval = ((rs1 as i32) / (rs2 as i32)) as u32;
+                                }
+                            } // DIV
+                            0b101 => {
+                                if rs2 == 0 {
+                                    rval = 0xffffffff;
+                                } else {
+                                    rval = rs1 / rs2;
+                                }
+                            } // DIVU
+                            0b110 => {
+                                if rs2 == 0 {
+                                    rval = rs1;
+                                } else {
+                                    rval = ((rs1 as i32) % (rs2 as i32)) as u32;
+                                }
+                            } // REM
+                            0b111 => {
+                                if rs2 == 0 {
+                                    rval = rs1;
+                                } else {
+                                    rval = rs1 % rs2;
+                                }
+                            } // REMU
+                            _default => {}
+                        }
+                    } else {
+                        match (ir >> 12) & 0b111 {
+                            // These could be either op-immediate or op commands.  Be careful.
+                            0b000 => {
+                                // addi
+                                rval = if is_reg && (ir & 0x40000000) != 0 {
+                                    rs1.wrapping_sub(rs2)
+                                } else {
+                                    rs1.wrapping_add(rs2)
+                                };
+                            }
+                            0b001 => {
+                                rval = rs1.wrapping_shl(rs2);
+                            }
+                            0b010 => {
+                                rval = ((rs1 as i32) < (rs2 as i32)) as u32;
+                            }
+                            0b011 => {
+                                rval = (rs1 < rs2) as u32;
+                            }
+                            0b100 => {
+                                rval = rs1 ^ rs2;
+                            }
+                            0b101 => {
+                                rval = if ir & 0x40000000 != 0 {
+                                    ((rs1 as i32).wrapping_shr(rs2)) as u32
+                                } else {
+                                    rs1.wrapping_shr(rs2)
+                                };
+                            }
+                            0b110 => {
+                                rval = rs1 | rs2;
+                            }
+                            0b111 => {
+                                rval = rs1 & rs2;
+                            }
+                            _default => {}
+                        }
+                    }
+                }
+                0b0001111 => {
+                    rdid = 0; // fencetype = (ir >> 12) & 0b111; We ignore fences in this impl.
+                }
+                0b1110011 => {
+                    // Zifencei+Zicsr
+
+                    let csrno = ir >> 20;
+                    let microop = (ir >> 12) & 0b111;
+                    if (microop & 3) != 0 {
+                        // It's a Zicsr function.
+
+                        let rs1imm = (ir >> 15) & 0x1f;
+                        let rs1 = state.reg(rs1imm);
+                        let mut writeval = rs1;
+
+                        // https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
+                        // Generally, support for Zicsr
+                        match csrno {
+                            0x340 => rval = state.mscratch,
+                            0x305 => rval = state.mtvec,
+                            0x304 => rval = state.mie,
+                            0xC00 => rval = state.cyclel,
+                            0x344 => rval = state.mip,
+                            0x341 => rval = state.mepc,
+                            0x300 => rval = state.mstatus, //mstatus
+                            0x342 => rval = state.mcause,
+                            0x343 => rval = state.mtval,
+                            0xf11 => {
+                                rval = 0xff0ff0ff;
+                            } //mvendorid
+                            0x301 => {
+                                rval = 0x40401101;
+                            } //misa (XLEN=32, IMA+X)
+                            //0x3B0: rval = 0; //pmpaddr0
+                            //0x3a0: rval = 0; //pmpcfg0
+                            //0xf12: rval = 0x00000000; //marchid
+                            //0xf13: rval = 0x00000000; //mimpid
+                            //0xf14: rval = 0x00000000; //mhartid
+                            _default => {
+                                rval = 0;
+                                handler.othercsr_read(csrno, 0);
+                            }
+                        }
+
+                        match microop {
+                            0b001 => {
+                                writeval = rs1;
+                            } //CSRRW
+                            0b010 => {
+                                writeval = rval | rs1;
+                            } //CSRRS
+                            0b011 => {
+                                writeval = rval & !rs1;
+                            } //CSRRC
+                            0b101 => {
+                                writeval = rs1imm;
+                            } //CSRRWI
+                            0b110 => {
+                                writeval = rval | rs1imm;
+                            } //CSRRSI
+                            0b111 => {
+                                writeval = rval & !rs1imm;
+                            } //CSRRCI
+                            _default => {}
+                        }
+
+                        match csrno {
+                            0x340 => state.mscratch = writeval,
+                            0x305 => state.mtvec = writeval,
+                            0x304 => state.mie = writeval,
+                            0x344 => state.mip = writeval,
+                            0x341 => state.mepc = writeval,
+                            0x300 => state.mstatus = writeval, //mstatus
+                            0x342 => state.mcause = writeval,
+                            0x343 => state.mtval = writeval,
+                            //0x3a0:  //pmpcfg0
+                            //0x3B0:  //pmpaddr0
+                            //0xf11:  //mvendorid
+                            //0xf12:  //marchid
+                            //0xf13:  //mimpid
+                            //0xf14:  //mhartid
+                            //0x301:  //misa
+                            _default => {
+                                handler.othercsr_write(image, csrno, writeval);
+                            }
+                        }
+                    } else if microop == 0b000 {
+                        // "SYSTEM"
+
+                        rdid = 0;
+                        if csrno == 0x105 {
+                            //WFI (Wait for interrupts)
+
+                            state.mstatus |= 8; //Enable interrupts
+                            state.extraflags |= 4; //Infor environment we want to go to sleep.
+                            state.pc = pc + 4;
+                            return Ok(1);
+                        } else if (csrno & 0xff) == 0x02 {
+                            // MRET
+
+                            //https://raw.githubusercontent.com/riscv/virtual-memory/main/specs/663-Svpbmt.pdf
+                            //Table 7.6. MRET then in mstatus/mstatush sets MPV=0, MPP=0, MIE=MPIE, and MPIE=1. La
+                            // Should also update mstatus to reflect correct mode.
+                            let startmstatus = state.mstatus;
+                            let startextraflags = state.extraflags;
+                            let newstatus =
+                                ((startmstatus & 0x80) >> 4) | ((startextraflags & 3) << 11) | 0x80;
+                            state.mstatus = newstatus;
+                            let newflags = (startextraflags & !3) | ((startmstatus >> 11) & 3);
+                            state.extraflags = newflags;
+                            pc = state.mepc - 4;
+                        } else {
+                            match csrno {
+                                0 => {
+                                    trap = if (state.extraflags & 3) != 0 {
+                                        11 + 1
+                                    } else {
+                                        8 + 1
+                                    };
+                                } // ECALL; 8 = "Environment call from U-mode"; 11 = "Environment call from M-mode"
+                                1 => {
+                                    trap = 3 + 1;
+                                } // EBREAK 3 = "Breakpoint"
+                                _default => {
+                                    trap = 2 + 1;
+                                } // Illegal opcode.
+                            }
+                        }
+                    } else {
+                        trap = 2 + 1;
+                    } // Note micrrop 0b100 == undefined.
+                }
+                0b0101111 => {
+                    // RV32A
+
+                    let mut rs1 = state.reg((ir >> 15) & 0x1f);
+                    let mut rs2 = state.reg((ir >> 20) & 0x1f);
+                    let irmid = (ir >> 27) & 0x1f;
+
+                    rs1 -= MINIRV32_RAM_IMAGE_OFFSET;
+
+                    // We don't implement load/store from UART or CLNT with RV32A here.
+
+                    if rs1 >= MINI_RV32_RAM_SIZE - 3 {
+                        trap = 7 + 1; //Store/AMO access fault
+                        rval = rs1 + MINIRV32_RAM_IMAGE_OFFSET;
+                    } else {
+                        let mut temp = image.load32(rs1);
+
+                        // Referenced a little bit of https://github.com/franzflasch/riscv_em/blob/master/src/core/core.c
+                        let mut dowrite = true;
+                        match irmid {
+                            0b00010 => {
+                                dowrite = false;
+                            } //LR.W
+                            0b00011 => {
+                                temp = 0;
+                            } //SC.W (Lie and always say it's good)
+                            0b00001 => {} //AMOSWAP.W
+                            0b00000 => {
+                                rs2 = rs2.wrapping_add(temp);
+                            } //AMOADD.W
+                            0b00100 => {
+                                rs2 ^= temp;
+                            } //AMOXOR.W
+                            0b01100 => {
+                                rs2 &= temp;
+                            } //AMOAND.W
+                            0b01000 => {
+                                rs2 |= temp;
+                            } //AMOOR.W
+                            0b10000 => {
+                                rs2 = if (rs2 as i32) < (temp as i32) {
+                                    rs2
+                                } else {
+                                    temp
+                                }
+                            } //AMOMIN.W
+                            0b10100 => {
+                                rs2 = if (rs2 as i32) > (temp as i32) {
+                                    rs2
+                                } else {
+                                    temp
+                                }
+                            } //AMOMAX.W
+                            0b11000 => {
+                                rs2 = if rs2 < temp { rs2 } else { temp };
+                            } //AMOMINU.W
+                            0b11100 => {
+                                rs2 = if rs2 > temp { rs2 } else { temp };
+                            } //AMOMAXU.W
+                            _default => {
+                                trap = 2 + 1;
+                                dowrite = false;
+                            } //Not supported.
+                        }
+                        rval = temp;
+                        if dowrite {
+                            image.store32(rs1, rs2);
+                        }
+                    }
+                }
+                _default => {
+                    trap = 2 + 1; // Fault: Invalid opcode.
+                }
             }
-            _default => {
-                trap = 2 + 1; // Fault: Invalid opcode.
+
+            if trap == 0 {
+                if rdid != 0 {
+                    state.regset(rdid, rval);
+                }
+                // Write back register.
+                else if (state.mip & (1 << 7) != 0)
+                    && (state.mie & (1 << 7) != 0/*mtie*/)
+                    && (state.mstatus & 0x8 != 0/*mie*/)
+                {
+                    trap = 0x80000007; // Timer interrupt.
+                }
             }
         }
 
-        if trap == 0 {
-            if rdid != 0 {
-                emu.state.regset(rdid as u32, rval);
+        handler.postexec(pc, ir, &mut trap)?;
+
+        // Handle traps and interrupts.
+        if trap != 0 {
+            if trap & 0x80000000 != 0 {
+                // If prefixed with 0x100, it's an interrupt, not a trap.
+
+                state.mcause = trap;
+                state.mtval = 0;
+                pc += 4; // PC needs to point to where the PC will return to.
+            } else {
+                state.mcause = trap - 1;
+                state.mtval = if trap > 5 && trap <= 8 { rval } else { pc };
             }
-            // Write back register.
-            else if (emu.state.mip & (1 << 7) != 0)
-                && (emu.state.mie & (1 << 7) != 0/*mtie*/)
-                && (emu.state.mstatus & 0x8 != 0/*mie*/)
-            {
-                trap = 0x80000007; // Timer interrupt.
+            state.mepc = pc; //TRICKY: The kernel advances mepc automatically.
+                             //CSR( mstatus ) & 8 = MIE, & 0x80 = MPIE
+                             // On an interrupt, the system moves current MIE into MPIE
+            let newmstatus = ((state.mstatus & 0x08) << 4) | ((state.extraflags & 3) << 11);
+            state.mstatus = newmstatus;
+            pc = state.mtvec.wrapping_sub(4);
+
+            // XXX TODO: Do we actually want to check here? Is this correct?
+            if (trap & 0x80000000) == 0 {
+                state.extraflags |= 3;
             }
         }
+
+        state.pc = pc.wrapping_add(4);
     }
-
-    let post_ret = emu.handler.postexec(pc, ir, trap);
-    if post_ret != 0 {
-        return post_ret;
-    }
-
-    // Handle traps and interrupts.
-    if trap != 0 {
-        rv32_handle_trap(&mut emu.state, trap, &mut pc, rval);
-    }
-
-    emu.state.pc = pc.wrapping_add(4);
-
-    return 0;
-}
-
-#[inline(never)]
-fn rv32_handle_trap(state: &mut MiniRV32IMAState, trap: u32, pc: &mut u32, rval: u32) {
-    if trap & 0x80000000 != 0 {
-        // If prefixed with 0x100, it's an interrupt, not a trap.
-
-        state.mcause = trap;
-        state.mtval = 0;
-        *pc += 4; // PC needs to point to where the PC will return to.
-    } else {
-        state.mcause = trap - 1;
-        state.mtval = if trap > 5 && trap <= 8 { rval } else { *pc };
-    }
-    state.mepc = *pc; //TRICKY: The kernel advances mepc automatically.
-                      //CSR( mstatus ) & 8 = MIE, & 0x80 = MPIE
-                      // On an interrupt, the system moves current MIE into MPIE
-    let newmstatus = ((state.mstatus & 0x08) << 4) | ((state.extraflags & 3) << 11);
-    state.mstatus = newmstatus;
-    *pc = state.mtvec.wrapping_sub(4);
-
-    // XXX TODO: Do we actually want to check here? Is this correct?
-    if (trap & 0x80000000) == 0 {
-        state.extraflags |= 3;
-    }
+    return Ok(0);
 }
 
 static DEFAULT64MBDTB: &[u8] = &[
