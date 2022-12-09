@@ -1,6 +1,6 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
 
-use std::{io::Write, num::Wrapping, time::Duration};
+use std::{time::Duration};
 
 /*
     To use mini-rv32ima.h for the bare minimum, the following:
@@ -154,7 +154,6 @@ pub fn main() {
             elapsed_us as u32,
             instrs_per_flip,
         ); // Execute upto 1024 cycles before breaking out.
-        let ret = ret.unwrap_or_else(|ret| ret);
         match ret {
             0 => {}
             1 => {
@@ -193,6 +192,7 @@ pub fn main() {
     dump_state(&proc_state, &ram_image, &ram_amt);
 }
 
+#[inline(never)]
 pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     let pc = core.pc;
     let pc_offset = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
@@ -225,6 +225,7 @@ pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     );
 }
 
+#[inline(never)]
 pub fn time_now_micros() -> u64 {
     let start = std::time::SystemTime::now();
     let since_the_epoch = start
@@ -237,7 +238,7 @@ static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 pub trait RVHandler {
-    fn postexec(&mut self, pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32>;
+    fn postexec(&mut self, pc: u32, ir: u32, retval: u32) -> i32;
     fn handle_mem_store_control(&mut self, addy: u32, rs2: u32) -> u32;
     fn handle_mem_load_control(&mut self, addy: u32) -> u32;
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, writeval: u32);
@@ -267,6 +268,7 @@ impl RVHandlerImpl {
             }
         }
     }
+    #[inline(never)]
     fn print_uart(&mut self) {
         // let mut out = std::io::stdout();
         // out.write("uart: ".as_bytes()).unwrap();
@@ -274,22 +276,26 @@ impl RVHandlerImpl {
         println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
         self.uart_buf.clear();
     }
+    #[inline(never)]
+    fn fail_postexec(&mut self, retval: u32) {
+        println!("FAULT retval: trap=={} (signed {})", retval, retval as i32);
+    }
 }
 impl RVHandler for RVHandlerImpl {
 
-    #[inline(never)]
-    fn postexec(&mut self, _pc: u32, ir: u32, retval: &mut u32) -> Result<i32, i32> {
+    
+    fn postexec(&mut self, _pc: u32, ir: u32, retval: u32) -> i32 {
         let fail_on_all_faults = false;
-        if *retval > 0 {
+        if retval > 0 {
             if fail_on_all_faults {
-                println!("FAULT retval: trap=={} (signed {})", retval, *retval as i32);
-                return Err(3);
+                self.fail_postexec(retval);
+                return 3;
             } else {
                 //retval = retval;
-                *retval = self.handle_exception(ir, *retval);
+                self.handle_exception(ir, retval);
             }
         }
-        return Ok(0);
+        return 0;
     }
 
     
@@ -370,9 +376,9 @@ impl RVHandler for RVHandlerImpl {
 //     handle_other_csr_write_impl(image, csrno as u16, writeval);
 // }
 
-static is_eofd: bool = false;
+static IS_EOFD: bool = false;
 fn read_keyboard_byte() -> u32 {
-    if is_eofd {
+    if IS_EOFD {
         return 0xffffffff;
     }
     let rxchar = 0;
@@ -387,7 +393,7 @@ fn read_keyboard_byte() -> u32 {
 }
 
 fn is_keyboard_hit() -> bool {
-    if is_eofd {
+    if IS_EOFD {
         return false;
     }
     //let byteswaiting;
@@ -627,7 +633,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     _v_proc_address: u32,
     elapsed_us: u32,
     count: u16,
-) -> Result<i32, i32> {
+) -> i32 {
     let new_timer: u32 = state.timerl + elapsed_us;
     if new_timer < state.timerl {
         state.timerh += 1;
@@ -646,7 +652,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     }
     // If WFI, don't run processor.
     if (state.extraflags & 4) != 0 {
-        return Ok(1);
+        return 1;
     }
 
     for _icount in 0..count {
@@ -864,7 +870,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                 //SYSCON (reboot, poweroff, etc.)
 
                                 state.pc = state.pc + 4;
-                                return Ok(rs2 as i32); // NOTE: PC will be PC of Syscon.
+                                return rs2 as i32; // NOTE: PC will be PC of Syscon.
                             } else {
                                 handler.handle_mem_store_control(addy, rs2);
                             }
@@ -1091,7 +1097,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             state.mstatus |= 8; //Enable interrupts
                             state.extraflags |= 4; //Infor environment we want to go to sleep.
                             state.pc = pc + 4;
-                            return Ok(1);
+                            return 1;
                         } else if (csrno & 0xff) == 0x02 {
                             // MRET
 
@@ -1216,37 +1222,47 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
             }
         }
 
-        handler.postexec(pc, ir, &mut trap)?;
+        let ret = handler.postexec(pc, ir, trap);
+        if ret != 0 {
+            return ret;
+        }
 
         // Handle traps and interrupts.
         if trap != 0 {
-            if trap & 0x80000000 != 0 {
-                // If prefixed with 0x100, it's an interrupt, not a trap.
-
-                state.mcause = trap;
-                state.mtval = 0;
-                pc += 4; // PC needs to point to where the PC will return to.
-            } else {
-                state.mcause = trap - 1;
-                state.mtval = if trap > 5 && trap <= 8 { rval } else { pc };
-            }
-            state.mepc = pc; //TRICKY: The kernel advances mepc automatically.
-                             //CSR( mstatus ) & 8 = MIE, & 0x80 = MPIE
-                             // On an interrupt, the system moves current MIE into MPIE
-            let newmstatus = ((state.mstatus & 0x08) << 4) | ((state.extraflags & 3) << 11);
-            state.mstatus = newmstatus;
-            pc = state.mtvec.wrapping_sub(4);
-
-            // XXX TODO: Do we actually want to check here? Is this correct?
-            if (trap & 0x80000000) == 0 {
-                state.extraflags |= 3;
-            }
+            rv32_handle_trap(state, trap, &mut pc, rval);
         }
 
         state.pc = pc.wrapping_add(4);
     }
-    return Ok(0);
+    return 0;
 }
+
+
+#[inline(never)]
+fn rv32_handle_trap(state: &mut MiniRV32IMAState, trap: u32, pc: &mut u32, rval: u32) {
+    if trap & 0x80000000 != 0 {
+        // If prefixed with 0x100, it's an interrupt, not a trap.
+
+        state.mcause = trap;
+        state.mtval = 0;
+        *pc += 4; // PC needs to point to where the PC will return to.
+    } else {
+        state.mcause = trap - 1;
+        state.mtval = if trap > 5 && trap <= 8 { rval } else { *pc };
+    }
+    state.mepc = *pc; //TRICKY: The kernel advances mepc automatically.
+                      //CSR( mstatus ) & 8 = MIE, & 0x80 = MPIE
+                      // On an interrupt, the system moves current MIE into MPIE
+    let newmstatus = ((state.mstatus & 0x08) << 4) | ((state.extraflags & 3) << 11);
+    state.mstatus = newmstatus;
+    *pc = state.mtvec.wrapping_sub(4);
+
+    // XXX TODO: Do we actually want to check here? Is this correct?
+    if (trap & 0x80000000) == 0 {
+        state.extraflags |= 3;
+    }
+}
+
 
 static DEFAULT64MBDTB: &[u8] = &[
     0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x05, 0x00,
