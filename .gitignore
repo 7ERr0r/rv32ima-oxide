@@ -2,5 +2,6 @@
 /Cargo.lock
 /flamegraph.svg
 /out.txt
-
+/oprofile_data
+/dump.txt
 

@@ -1,22 +1,49 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
 // Modified by 7ERr0r and converted to Rust
 
-/*
-    To use mini-rv32ima.h for the bare minimum, the following:
-    #define MINI_RV32_RAM_SIZE ram_amt
-    #define MINIRV32_IMPLEMENTATION
-    #include "mini-rv32ima.h"
-    Though, that's not _that_ interesting. You probably want I/O!
-    Notes:
-        * There is a dedicated CLNT at 0x10000000.
-        * There is free MMIO from there to 0x12000000.
-        * You can put things like a UART, or whatever there.
-        * Feel free to override any of the functionality with macros.
-*/
+use std::{fs::File, hint::unreachable_unchecked, io::Read, path::PathBuf};
 
-use std::fs::File;
+use clap::Parser;
 
-static DEBUG_INSTR: bool = false;
+/// Rust remix of mini-rv32ima by cnlohr
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+pub struct RVArgs {
+    /// Instruction count
+    #[arg(short, long, default_value_t = 64 * 1024 * 1024)]
+    memory_ram: u32,
+
+    /// Instruction count
+    #[arg(short, long, default_value_t = 0x7fffffffffffffff)]
+    count_instruction: u64,
+
+    /// Number of times to repeat - useful for benchmarking
+    #[arg(short, long, default_value_t = 1)]
+    repeat: u32,
+
+    #[arg(short, long, default_value_t = false)]
+    /// Lock time base to instruction count. Use locked time update to disable realtime system clock
+    lock_time_update: bool,
+
+    #[arg(short, long, default_value_t = 1)]
+    /// Slowdown used for a fixed-time step
+    time_divisor: u64,
+
+    #[arg(short, long, default_value_t = false)]
+    /// Useful for debugging. Prints processor state in every step
+    single_step: bool,
+
+    #[arg(short, long, default_value_t = false)]
+    /// Use to disable micro-sleep when wfi
+    presto_disable_sleep: bool,
+
+    #[arg(short, long)]
+    /// Path to running image file
+    file_image: Option<PathBuf>,
+    // #[arg(long, default_value_t = false)]
+    // /// Use builtin pprof?
+    // pprof: bool,
+}
 
 pub fn main() {
     // let guard = pprof::ProfilerGuardBuilder::default()
@@ -25,27 +52,37 @@ pub fn main() {
     //     .build()
     //     .unwrap();
 
-    init_run_riscv_emulator();
+    let args = RVArgs::parse();
+
+    for _irun in 0..args.repeat {
+        init_run_riscv_emulator(&args);
+    }
 
     // if let Ok(report) = guard.report().build() {
     //     let file = File::create("flamegraph.svg").unwrap();
     //     report.flamegraph(file).unwrap();
     // };
 }
-pub fn init_run_riscv_emulator() {
-    let ram_amt: u32 = MINI_RV32_RAM_SIZE;
-    let instct: u64 = 46_000_000 as u64;
-    let time_divisor = 1;
-    let fixed_time_update = true;
-    let do_sleep = false;
-    let single_step = false;
+pub fn init_run_riscv_emulator(args: &RVArgs) {
+    let ram_amt: u32 = args.memory_ram;
+    //let instct: u64 = 46_000_000 as u64;
+    let do_sleep = !args.presto_disable_sleep;
 
     let mut image = vec![0; ram_amt as usize];
 
     {
-        let file_image = include_bytes!("DownloadedImage");
-        let im = &mut image[..file_image.len()];
-        im.copy_from_slice(file_image);
+        let mut contents_buf;
+        let image_bytes = if let Some(file_path) = &args.file_image {
+            let mut file = File::open(file_path).expect("File::open failed for -f image");
+            contents_buf = Vec::new();
+            file.read_to_end(&mut contents_buf)
+                .expect("file.read_to_end failed for -f image");
+            contents_buf.as_slice()
+        } else {
+            include_bytes!("DownloadedImage").as_slice()
+        };
+        let im = &mut image[..image_bytes.len()];
+        im.copy_from_slice(image_bytes);
     }
 
     let opt_dtb_bytes = Some(DEFAULT64MBDTB);
@@ -58,7 +95,7 @@ pub fn init_run_riscv_emulator() {
         im.copy_from_slice(dbt_bytes);
 
         let value_offset = dtb_offset as u32 + 0x13c;
-        let mut ram_image = RVImage { image: &mut image };
+        let mut ram_image = RVImageRam::new(&mut image);
         if ram_image.load32(value_offset) == 0x00c0ff03 {
             let validram = dtb_offset as u32;
             ram_image.store32be(value_offset, validram);
@@ -66,7 +103,7 @@ pub fn init_run_riscv_emulator() {
         dtb_ptr = dtb_offset as u32;
     }
 
-    let mut handler = RVHandlerImpl::default();
+    let mut handler = RVHandlerImpl::new();
 
     // The core lives on the heap
     let mut proc_state_obj = Box::new(MiniRV32IMAState::default());
@@ -85,13 +122,17 @@ pub fn init_run_riscv_emulator() {
 
     // Image is loaded.
 
+    // let mut handler = handler.clone();
+    // let mut proc_state = proc_state.clone();
+    // let mut image = image.clone();
+
     run_emu(
         &mut handler,
-        fixed_time_update,
-        single_step,
+        args.lock_time_update,
+        args.single_step,
         do_sleep,
-        time_divisor,
-        instct,
+        args.time_divisor,
+        args.count_instruction,
         &mut proc_state,
         &mut image,
     );
@@ -124,11 +165,11 @@ pub fn run_emu<H: RVHandler>(
         last_time += elapsed_us;
 
         if single_step {
-            let mut ram_image = RVImage { image: vec_image };
+            let mut ram_image = RVImageRam::new(vec_image);
             dump_state(&proc_state, &mut ram_image);
         }
 
-        let ram_image = RVImage { image: vec_image };
+        let ram_image = RVImageRam::new(vec_image);
         let ret = mini_rv32_ima_step(
             proc_state,
             ram_image,
@@ -168,39 +209,46 @@ pub fn run_emu<H: RVHandler>(
     }
     //println!("end of loop");
 
-    let ram_image = RVImage { image: vec_image };
+    let ram_image = RVImageRam::new(vec_image);
     dump_state(&proc_state, &ram_image);
 }
 
 #[cold]
 #[inline(never)]
-pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage) {
+pub fn dump_state(core: &MiniRV32IMAState, image: &RVImageRam) {
+    use std::io::Write;
     let pc = core.pc;
     let pc_offset = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
     let ir;
 
-    print!("PC: {:08x} ", pc);
-    if pc_offset <= image.image.len() as u32 - 4 {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = write!(out, "PC: {:08x} ", pc);
+    if pc_offset <= image.len_minus_4() {
         ir = image.load32(pc_offset);
-        print!("[0x{:08x}] ", ir);
+        let _ = write!(out, "[0x{:08x}] ", ir);
     } else {
-        print!("[xxxxxxxxxx] ");
+        let _ = write!(out, "[xxxxxxxxxx] ");
     }
     let regs = &core.regs;
-    print!(
+    let _ = write!(
+        out,
         "Z:{:08x} ra:{:08x} sp:{:08x} gp:{:08x} tp:{:08x} t0:{:08x} t1:{:08x} t2:{:08x} ",
         regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
     );
-    print!(
+    let _ = write!(
+        out,
         "s0:{:08x} s1:{:08x} a0:{:08x} a1:{:08x} a2:{:08x} a3:{:08x} a4:{:08x} a5:{:08x} ",
         regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15]
     );
 
-    print!(
+    let _ = write!(
+        out,
         "a6:{:08x} a7:{:08x} s2:{:08x} s3:{:08x} s4:{:08x} s5:{:08x} s6:{:08x} s7:{:08x}",
         regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
     );
-    print!(
+    let _ = write!(
+        out,
         "s8:{:08x} s9:{:08x} s10:{:08x} s11:{:08x} t3:{:08x} t4:{:08x} t5:{:08x} t6:{:08x}\n",
         regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31]
     );
@@ -215,7 +263,7 @@ pub fn time_now_micros() -> u64 {
     since_the_epoch.as_micros() as u64
 }
 
-static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
+//static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 pub trait RVHandler {
@@ -226,20 +274,26 @@ pub trait RVHandler {
     #[cold]
     fn handle_mem_load_control(&mut self, addy: u32) -> u32;
     #[cold]
-    fn othercsr_write(&mut self, image: &RVImage, csrno: u32, writeval: u32);
+    fn othercsr_write(&mut self, image: &RVImageRam, csrno: u32, writeval: u32);
     #[cold]
     fn othercsr_read(&mut self, csrno: u32, rval: u32);
 
     fn tick_stdout(&mut self);
 }
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct RVHandlerImpl {
     pub uart_buf: Vec<u8>,
     pub uart_dirty_ticks: u8,
 }
 
 impl RVHandlerImpl {
+    pub fn new() -> Self {
+        Self {
+            uart_buf: Vec::with_capacity(1024),
+            uart_dirty_ticks: 0,
+        }
+    }
     fn handle_exception(&mut self, _ir: u32, code: u32) -> u32 {
         // Weird opcode emitted by duktape on exit.
         if code == 3 {
@@ -253,8 +307,10 @@ impl RVHandlerImpl {
         // let mut out = std::io::stdout();
         // out.write("uart: ".as_bytes()).unwrap();
         // out.write(&self.uart_buf).unwrap();
-        println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
-        self.uart_buf.clear();
+        if self.uart_buf.len() > 0 {
+            println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
+            self.uart_buf.clear();
+        }
     }
     #[cold]
     #[inline(never)]
@@ -321,7 +377,7 @@ impl RVHandler for RVHandlerImpl {
 
     #[cold]
     #[inline(never)]
-    fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
+    fn othercsr_write(&mut self, image: &RVImageRam, csrno: u32, value: u32) {
         if csrno == 0x136 {
             println!("{}", value);
         }
@@ -344,7 +400,7 @@ impl RVHandler for RVHandlerImpl {
             if ptr_end != ptr_start {
                 let slice = &image.image[ptr_start as usize..ptr_end as usize];
                 let s = String::from_utf8_lossy(&slice);
-                println!("{}", s);
+                println!("0x138 string: {:?}", s);
             }
         }
     }
@@ -423,7 +479,7 @@ impl MiniRV32IMAState {
 
         #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.as_ptr().add(reg_index as usize)
+            *self.regs.as_ptr().offset(reg_index as isize)
         }
     }
     pub fn regset(&mut self, reg_index: u32, value: u32) {
@@ -433,7 +489,7 @@ impl MiniRV32IMAState {
         }
         #[cfg(not(debug_assertions))]
         unsafe {
-            *self.regs.as_mut_ptr().add(reg_index as usize) = value
+            *self.regs.as_mut_ptr().offset(reg_index as isize) = value
         }
     }
     pub fn cycle(&self) -> u64 {
@@ -463,10 +519,22 @@ impl MiniRV32IMAState {
     }
 }
 
-pub struct RVImage<'a> {
+pub struct RVImageRam<'a> {
     image: &'a mut [u8],
+    //len_minus_4: u32,
 }
-impl<'a> RVImage<'a> {
+impl<'a> RVImageRam<'a> {
+    pub fn new(slice: &'a mut [u8]) -> Self {
+        Self {
+            //len_minus_4: slice.len() as u32 - 4,
+            image: slice,
+        }
+    }
+
+    pub fn len_minus_4(&self) -> u32 {
+        self.image.len() as u32 - 4
+    }
+    #[inline]
     pub fn load32(&self, offset: u32) -> u32 {
         #[cfg(debug_assertions)]
         {
@@ -477,7 +545,6 @@ impl<'a> RVImage<'a> {
             self.load32unsafe(offset)
         }
     }
-
     /// Always safe, since slice above is checked
     pub fn load32safe(&self, offset: u32) -> u32 {
         let ofs = offset as usize;
@@ -487,13 +554,13 @@ impl<'a> RVImage<'a> {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u32>()])
         })
     }
-
+    #[inline]
     /// UNSAFE
     pub unsafe fn load32unsafe(&self, offset: u32) -> u32 {
-        let ptr = self.image.as_ptr().add(offset as usize) as *const u32;
+        let ptr = self.image.as_ptr().offset(offset as isize) as *const u32;
         *ptr
     }
-
+    #[inline]
     pub fn load16(&self, offset: u32) -> u16 {
         #[cfg(debug_assertions)]
         {
@@ -504,7 +571,6 @@ impl<'a> RVImage<'a> {
             self.load16unsafe(offset)
         }
     }
-
     /// Always safe, since slice above is checked
     pub fn load16safe(&self, offset: u32) -> u16 {
         let ofs = offset as usize;
@@ -514,12 +580,13 @@ impl<'a> RVImage<'a> {
             *(slice.as_ptr() as *const [u8; core::mem::size_of::<u16>()])
         })
     }
+    #[inline]
     /// UNSAFE
     pub unsafe fn load16unsafe(&self, offset: u32) -> u16 {
-        let ptr = self.image.as_ptr().add(offset as usize) as *const u16;
+        let ptr = self.image.as_ptr().offset(offset as isize) as *const u16;
         *ptr
     }
-
+    #[inline]
     pub fn load8(&self, offset: u32) -> u8 {
         #[cfg(debug_assertions)]
         {
@@ -533,10 +600,12 @@ impl<'a> RVImage<'a> {
     pub fn load8safe(&self, offset: u32) -> u8 {
         self.image[offset as usize]
     }
+    #[inline]
     pub unsafe fn load8unsafe(&self, offset: u32) -> u8 {
-        *self.image.as_ptr().add(offset as usize)
+        *self.image.as_ptr().offset(offset as isize)
     }
 
+    #[inline]
     pub fn store32(&mut self, offset: u32, val: u32) {
         #[cfg(debug_assertions)]
         {
@@ -558,8 +627,9 @@ impl<'a> RVImage<'a> {
             *ptr = val.to_le_bytes();
         };
     }
+    #[inline]
     pub unsafe fn store32unsafe(&mut self, offset: u32, val: u32) {
-        let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u32;
+        let ptr = self.image.as_mut_ptr().offset(offset as isize) as *mut u32;
         *ptr = val;
     }
 
@@ -574,6 +644,7 @@ impl<'a> RVImage<'a> {
         };
     }
 
+    #[inline]
     pub fn store16(&mut self, offset: u32, val: u16) {
         #[cfg(debug_assertions)]
         {
@@ -595,11 +666,13 @@ impl<'a> RVImage<'a> {
         };
     }
 
+    #[inline]
     pub unsafe fn store16unsafe(&mut self, offset: u32, val: u16) {
-        let ptr = self.image.as_mut_ptr().add(offset as usize) as *mut u16;
+        let ptr = self.image.as_mut_ptr().offset(offset as isize) as *mut u16;
         *ptr = val;
     }
 
+    #[inline]
     pub fn store8(&mut self, offset: u32, val: u8) {
         #[cfg(debug_assertions)]
         {
@@ -613,15 +686,16 @@ impl<'a> RVImage<'a> {
     pub fn store8safe(&mut self, offset: u32, val: u8) {
         self.image[offset as usize] = val
     }
+    #[inline]
     pub unsafe fn store8unsafe(&mut self, offset: u32, val: u8) {
-        *self.image.as_mut_ptr().add(offset as usize) = val
+        *self.image.as_mut_ptr().offset(offset as isize) = val
     }
 }
 
 #[inline(never)]
 pub fn mini_rv32_ima_step<H: RVHandler>(
     state: &mut MiniRV32IMAState,
-    mut image: RVImage,
+    mut image: RVImageRam,
     handler: &mut H,
     elapsed_us: u32,
     mut remaining_count: u16,
@@ -648,6 +722,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     }
 
     let mut step_return = 0;
+    let ram_minus_4byte = image.len_minus_4();
+
+    let mut pc: u32 = state.pc;
 
     let mut icount = 0;
     while icount < remaining_count {
@@ -657,21 +734,19 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
 
         // changed to increment_cycles() only when needed
 
-        let mut pc: u32 = state.pc;
         let ofs_pc: u32 = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
 
-        if ofs_pc >= MINI_RV32_RAM_SIZE {
+        if ofs_pc >= ram_minus_4byte {
             trap = 1 + 1; // Handle access violation on instruction read.
         } else if ofs_pc & 3 != 0 {
             trap = 1 + 0; //Handle PC-misaligned access
         } else {
             ir = image.load32(ofs_pc);
-            if DEBUG_INSTR {
-                //println!("IR 0x{:08x}", ir);
-            }
+
             let mut rdid: u8 = ((ir >> 7) & 0x1f) as u8;
 
-            match ir & 0x7f {
+            let ir_low = (ir as u8) & 0x7f;
+            match ir_low {
                 0b0110111 => {
                     // LUI
 
@@ -770,7 +845,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     let mut rsval: u32 = (rs1 as i32).wrapping_add(imm_se) as u32;
 
                     rsval = rsval.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-                    if rsval >= MINI_RV32_RAM_SIZE - 3 {
+                    if rsval > ram_minus_4byte {
                         rsval -= MINIRV32_RAM_IMAGE_OFFSET;
                         if rsval >= 0x10000000 && rsval < 0x12000000 {
                             // UART, CLNT
@@ -798,9 +873,6 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             }
                             0b010 => {
                                 rval = image.load32(rsval);
-                                if DEBUG_INSTR {
-                                    //println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
-                                }
                             }
                             0b100 => {
                                 rval = image.load8(rsval) as u32;
@@ -827,12 +899,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                         .wrapping_add(rs1)
                         .wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
 
-                    if DEBUG_INSTR {
-                        //println!("STORE 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, addy);
-                    }
                     rdid = 0;
 
-                    if addy > MINI_RV32_RAM_SIZE - 4 {
+                    if addy > ram_minus_4byte {
                         addy = addy.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
                         if addy >= 0x10000000 && addy < 0x12000000 {
                             // Should be stuff like SYSCON, 8250, CLNT
@@ -845,7 +914,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             } else if addy == 0x11100000 {
                                 //SYSCON (reboot, poweroff, etc.)
 
-                                state.pc = state.pc + 4;
+                                pc = pc + 4;
                                 step_return = rs2 as i32; // NOTE: PC will be PC of Syscon.
                                 break;
                             } else {
@@ -884,64 +953,62 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     let is_reg = (ir & 0b100000) != 0;
                     let rs2 = if is_reg { state.reg(imm & 0x1f) } else { imm };
 
-                    if DEBUG_INSTR {
-                        // println!(
-                        //     "OP-IM 0x{:08x} 0x{:08x} 0x{:08x}",
-                        //     rs1,
-                        //     rs2,
-                        //     if is_reg { 1 } else { 0 }
-                        // );
-                    }
-
                     if is_reg && (ir & 0x02000000 != 0) {
-                        match (ir >> 12) & 7 {
+                        //match (ir >> 12) & 7 {
+                        match ir & (0b111 << 12) {
                             //0x02000000 = RV32M
-                            0b000 => {
+                            0b000_000000000000 => {
                                 rval = rs1.wrapping_mul(rs2);
                             } // MUL
-                            0b001 => {
+                            0b001_000000000000 => {
                                 rval = (((rs1 as i32 as i64) * (rs2 as i32 as i64)) >> 32) as u32;
                             } // MULH
-                            0b010 => {
+                            0b010_000000000000 => {
                                 rval = (((rs1 as i32 as i64) * (rs2 as u64 as i64)) >> 32) as u32;
                             } // MULHSU
-                            0b011 => {
+                            0b011_000000000000 => {
                                 rval = (((rs1 as u64) * (rs2 as u64)) >> 32) as u32;
                             } // MULHU
-                            0b100 => {
+                            0b100_000000000000 => {
                                 if rs2 == 0 {
                                     rval = -1 as i32 as u32;
                                 } else {
                                     rval = ((rs1 as i32) / (rs2 as i32)) as u32;
                                 }
                             } // DIV
-                            0b101 => {
+                            0b101_000000000000 => {
                                 if rs2 == 0 {
                                     rval = 0xffffffff;
                                 } else {
                                     rval = rs1 / rs2;
                                 }
                             } // DIVU
-                            0b110 => {
+                            0b110_000000000000 => {
                                 if rs2 == 0 {
                                     rval = rs1;
                                 } else {
                                     rval = ((rs1 as i32) % (rs2 as i32)) as u32;
                                 }
                             } // REM
-                            0b111 => {
+                            0b111_000000000000 => {
                                 if rs2 == 0 {
                                     rval = rs1;
                                 } else {
                                     rval = rs1 % rs2;
                                 }
                             } // REMU
-                            _default => {}
+                            _default => {
+                                unsafe {
+                                    // Safe since all 8 out of 8 cases are defined above
+                                    unreachable_unchecked()
+                                }
+                            }
                         }
                     } else {
-                        match (ir >> 12) & 0b111 {
+                        //match (ir >> 12) & 0b111 {
+                        match ir & (0b111 << 12) {
                             // These could be either op-immediate or op commands.  Be careful.
-                            0b000 => {
+                            0b000_000000000000 => {
                                 // addi
                                 rval = if is_reg && (ir & 0x40000000) != 0 {
                                     rs1.wrapping_sub(rs2)
@@ -949,32 +1016,37 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                     rs1.wrapping_add(rs2)
                                 };
                             }
-                            0b001 => {
+                            0b001_000000000000 => {
                                 rval = rs1.wrapping_shl(rs2);
                             }
-                            0b010 => {
+                            0b010_000000000000 => {
                                 rval = ((rs1 as i32) < (rs2 as i32)) as u32;
                             }
-                            0b011 => {
+                            0b011_000000000000 => {
                                 rval = (rs1 < rs2) as u32;
                             }
-                            0b100 => {
+                            0b100_000000000000 => {
                                 rval = rs1 ^ rs2;
                             }
-                            0b101 => {
+                            0b101_000000000000 => {
                                 rval = if ir & 0x40000000 != 0 {
                                     ((rs1 as i32).wrapping_shr(rs2)) as u32
                                 } else {
                                     rs1.wrapping_shr(rs2)
                                 };
                             }
-                            0b110 => {
+                            0b110_000000000000 => {
                                 rval = rs1 | rs2;
                             }
-                            0b111 => {
+                            0b111_000000000000 => {
                                 rval = rs1 & rs2;
                             }
-                            _default => {}
+                            _default => {
+                                unsafe {
+                                    // Safe since all 8 out of 8 cases are defined above
+                                    unreachable_unchecked()
+                                }
+                            }
                         }
                     }
                 }
@@ -1072,10 +1144,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                         rdid = 0;
                         if csrno == 0x105 {
                             //WFI (Wait for interrupts)
-
                             state.mstatus |= 8; //Enable interrupts
                             state.extraflags |= 4; //Infor environment we want to go to sleep.
-                            state.pc = pc + 4;
+                            pc = pc + 4;
                             step_return = 1;
                             break;
                         } else if (csrno & 0xff) == 0x02 {
@@ -1124,7 +1195,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
 
                     // We don't implement load/store from UART or CLNT with RV32A here.
 
-                    if rs1 >= MINI_RV32_RAM_SIZE - 3 {
+                    if rs1 > ram_minus_4byte {
                         trap = 7 + 1; //Store/AMO access fault
                         rval = rs1 + MINIRV32_RAM_IMAGE_OFFSET;
                     } else {
@@ -1212,9 +1283,10 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
             rv32_handle_trap(state, trap, &mut pc, rval);
         }
 
-        state.pc = pc.wrapping_add(4);
+        pc = pc.wrapping_add(4);
         icount += 1;
     }
+    state.pc = pc;
 
     {
         // Increment clock by the number of run

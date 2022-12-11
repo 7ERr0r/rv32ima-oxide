@@ -5,4 +5,9 @@ edition = "2021"
 
 
 [dependencies]
-pprof = { version = "0.11", features = ["flamegraph"] }
+clap = { version = "4.0.29", features = ["derive"] }
+#pprof = { version = "0.11", features = ["flamegraph"] }
+
+
+[profile.release]
+debug = true
