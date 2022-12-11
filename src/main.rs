@@ -14,14 +14,30 @@
         * Feel free to override any of the functionality with macros.
 */
 
+use std::fs::File;
+
 static DEBUG_INSTR: bool = false;
 
 pub fn main() {
+    // let guard = pprof::ProfilerGuardBuilder::default()
+    //     .frequency(1000)
+    //     .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+    //     .build()
+    //     .unwrap();
+
+    init_run_riscv_emulator();
+
+    // if let Ok(report) = guard.report().build() {
+    //     let file = File::create("flamegraph.svg").unwrap();
+    //     report.flamegraph(file).unwrap();
+    // };
+}
+pub fn init_run_riscv_emulator() {
     let ram_amt: u32 = MINI_RV32_RAM_SIZE;
-    let mut instct: u64 = 4600_700_000 as u64;
+    let instct: u64 = 46_000_000 as u64;
     let time_divisor = 1;
-    let fixed_time_update = false;
-    let do_sleep = true;
+    let fixed_time_update = true;
+    let do_sleep = false;
     let single_step = false;
 
     let mut image = vec![0; ram_amt as usize];
@@ -68,6 +84,29 @@ pub fn main() {
     proc_state.extraflags |= 3; // Machine-mode.
 
     // Image is loaded.
+
+    run_emu(
+        &mut handler,
+        fixed_time_update,
+        single_step,
+        do_sleep,
+        time_divisor,
+        instct,
+        &mut proc_state,
+        &mut image,
+    );
+}
+
+pub fn run_emu<H: RVHandler>(
+    handler: &mut H,
+    fixed_time_update: bool,
+    single_step: bool,
+    do_sleep: bool,
+    time_divisor: u64,
+    mut max_instr_count: u64,
+    proc_state: &mut MiniRV32IMAState,
+    vec_image: &mut Vec<u8>,
+) {
     let mut last_time: u64 = if fixed_time_update {
         0
     } else {
@@ -75,7 +114,7 @@ pub fn main() {
     };
     let instrs_per_flip = if single_step { 1 } else { 1024 };
     let mut rt: u64 = 0;
-    while rt < instct + 1 {
+    while rt < max_instr_count + 1 {
         let elapsed_us: u64;
         if fixed_time_update {
             elapsed_us = proc_state.cycle() / time_divisor - last_time;
@@ -85,16 +124,15 @@ pub fn main() {
         last_time += elapsed_us;
 
         if single_step {
-            let mut ram_image = RVImage { image: &mut image };
-            dump_state(&proc_state, &mut ram_image, &ram_amt);
+            let mut ram_image = RVImage { image: vec_image };
+            dump_state(&proc_state, &mut ram_image);
         }
 
-        let ram_image = RVImage { image: &mut image };
+        let ram_image = RVImage { image: vec_image };
         let ret = mini_rv32_ima_step(
-            &mut proc_state,
+            proc_state,
             ram_image,
-            &mut handler,
-            0,
+            handler,
             elapsed_us as u32,
             instrs_per_flip,
         ); // Execute upto 1024 cycles before breaking out.
@@ -107,7 +145,7 @@ pub fn main() {
                 }
             }
             3 => {
-                instct = 0;
+                max_instr_count = 0;
             }
             0x7777 => {
                 //goto restart;	//syscon code for restart
@@ -128,20 +166,21 @@ pub fn main() {
 
         rt += instrs_per_flip as u64;
     }
-    println!("end of loop");
+    //println!("end of loop");
 
-    let ram_image = RVImage { image: &mut image };
-    dump_state(&proc_state, &ram_image, &ram_amt);
+    let ram_image = RVImage { image: vec_image };
+    dump_state(&proc_state, &ram_image);
 }
 
+#[cold]
 #[inline(never)]
-pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
+pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage) {
     let pc = core.pc;
     let pc_offset = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
     let ir;
 
     print!("PC: {:08x} ", pc);
-    if pc_offset <= ram_amt - 4 {
+    if pc_offset <= image.image.len() as u32 - 4 {
         ir = image.load32(pc_offset);
         print!("[0x{:08x}] ", ir);
     } else {
@@ -167,7 +206,7 @@ pub fn dump_state(core: &MiniRV32IMAState, image: &RVImage, ram_amt: &u32) {
     );
 }
 
-#[inline(never)]
+#[cold]
 pub fn time_now_micros() -> u64 {
     let start = std::time::SystemTime::now();
     let since_the_epoch = start
@@ -180,11 +219,18 @@ static MINI_RV32_RAM_SIZE: u32 = 1024 * 1024 * 64;
 static MINIRV32_RAM_IMAGE_OFFSET: u32 = 0x80000000;
 
 pub trait RVHandler {
+    #[cold]
     fn postexec(&mut self, pc: u32, ir: u32, retval: u32) -> i32;
+    #[cold]
     fn handle_mem_store_control(&mut self, addy: u32, rs2: u32) -> u32;
+    #[cold]
     fn handle_mem_load_control(&mut self, addy: u32) -> u32;
+    #[cold]
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, writeval: u32);
+    #[cold]
     fn othercsr_read(&mut self, csrno: u32, rval: u32);
+
+    fn tick_stdout(&mut self);
 }
 
 #[derive(Default)]
@@ -201,16 +247,8 @@ impl RVHandlerImpl {
         }
         code
     }
-    fn tick_stdout(&mut self) {
-        if self.uart_buf.len() > 0 {
-            self.uart_dirty_ticks += 1;
-            if self.uart_dirty_ticks > 250 {
-                self.uart_dirty_ticks = 0;
-                self.print_uart();
-            }
-        }
-    }
-    #[inline(never)]
+
+    #[cold]
     fn print_uart(&mut self) {
         // let mut out = std::io::stdout();
         // out.write("uart: ".as_bytes()).unwrap();
@@ -218,6 +256,7 @@ impl RVHandlerImpl {
         println!("uart: {:?}", String::from_utf8_lossy(&self.uart_buf));
         self.uart_buf.clear();
     }
+    #[cold]
     #[inline(never)]
     fn fail_postexec(&mut self, retval: u32) {
         println!("FAULT retval: trap=={} (signed {})", retval, retval as i32);
@@ -238,6 +277,7 @@ impl RVHandler for RVHandlerImpl {
         return 0;
     }
 
+    #[cold]
     #[inline(never)]
     fn handle_mem_store_control(&mut self, addy: u32, val: u32) -> u32 {
         if addy == 0x10000000 {
@@ -255,6 +295,18 @@ impl RVHandler for RVHandlerImpl {
         }
         return 0;
     }
+
+    fn tick_stdout(&mut self) {
+        if self.uart_buf.len() > 0 {
+            self.uart_dirty_ticks += 1;
+            if self.uart_dirty_ticks > 250 {
+                self.uart_dirty_ticks = 0;
+                self.print_uart();
+            }
+        }
+    }
+
+    #[cold]
     #[inline(never)]
     fn handle_mem_load_control(&mut self, addy: u32) -> u32 {
         // Emulating a 8250 / 16550 UART
@@ -267,6 +319,7 @@ impl RVHandler for RVHandlerImpl {
         return 0;
     }
 
+    #[cold]
     #[inline(never)]
     fn othercsr_write(&mut self, image: &RVImage, csrno: u32, value: u32) {
         if csrno == 0x136 {
@@ -296,6 +349,7 @@ impl RVHandler for RVHandlerImpl {
         }
     }
 
+    #[cold]
     fn othercsr_read(&mut self, _csrno: u32, _rval: u32) {}
 }
 
@@ -327,11 +381,12 @@ fn is_keyboard_hit() -> bool {
     false
 }
 
+#[cold]
 fn mini_sleep() {
     std::thread::sleep(std::time::Duration::from_micros(100));
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Copy)]
 pub struct MiniRV32IMAState {
     pub regs: [u32; 32],
 
@@ -385,7 +440,26 @@ impl MiniRV32IMAState {
         self.cyclel as u64
     }
     pub fn set_cycle(&mut self, cycle: u64) {
-        self.cyclel = cycle as u32
+        self.cyclel = cycle as u32;
+        self.cycleh = (cycle >> 32) as u32;
+    }
+
+    #[cold]
+    pub fn increment_cycles(&mut self, icount: &mut u16, remaining: &mut u16) -> u32 {
+        let lastl = self.cyclel;
+        let i = *icount;
+        // Lower the number of remaining cycles to do in rv_step
+        *remaining -= i;
+
+        // Increment clock
+        let newl = lastl + i as u32;
+        self.cyclel = newl;
+        if newl < lastl {
+            self.cycleh += 1;
+        }
+
+        *icount = 0;
+        newl
     }
 }
 
@@ -544,13 +618,13 @@ impl<'a> RVImage<'a> {
     }
 }
 
+#[inline(never)]
 pub fn mini_rv32_ima_step<H: RVHandler>(
     state: &mut MiniRV32IMAState,
     mut image: RVImage,
     handler: &mut H,
-    _v_proc_address: u32,
     elapsed_us: u32,
-    count: u16,
+    mut remaining_count: u16,
 ) -> i32 {
     let new_timer: u32 = state.timerl + elapsed_us;
     if new_timer < state.timerl {
@@ -573,16 +647,15 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
         return 1;
     }
 
-    for _icount in 0..count {
+    let mut step_return = 0;
+
+    let mut icount = 0;
+    while icount < remaining_count {
         let mut ir = 0;
         let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
         let mut rval = 0;
 
-        // Increment both wall-clock and instruction count time.  (NOTE: Not strictly needed to run Linux)
-        state.cyclel += 1;
-        if state.cyclel == 0 {
-            state.cycleh += 1;
-        }
+        // changed to increment_cycles() only when needed
 
         let mut pc: u32 = state.pc;
         let ofs_pc: u32 = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
@@ -609,22 +682,18 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     rval = pc.wrapping_add(ir & 0xfffff000);
                 }
                 0b1101111 => {
-                    // JAL
+                    // // JAL
 
                     let mut reladdy: i32 = (((ir & 0x80000000) >> 11)
                         | ((ir & 0x7fe00000) >> 20)
                         | ((ir & 0x00100000) >> 9)
                         | (ir & 0x000ff000)) as i32;
 
-                    if DEBUG_INSTR {
-                        //println!("JAL 0x{:08x}", reladdy);
-                    }
                     if reladdy & 0x00100000 != 0 {
                         reladdy |= 0xffe00000 as u32 as i32; // Sign extension.
                     }
                     rval = pc + 4;
-                    //pc = pc + reladdy - 4;
-                    pc = (pc as i32 + reladdy as i32).wrapping_sub(4) as u32;
+                    pc = (pc as i32 + reladdy).wrapping_sub(4) as u32;
                 }
                 0b1100111 => {
                     // JALR
@@ -639,12 +708,6 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                 }
                 0b1100011 => {
                     // Branch
-                    // uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
-                    // if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
-                    // int32_t rs1 = REG((ir >> 15) & 0x1f);
-                    // int32_t rs2 = REG((ir >> 20) & 0x1f);
-                    // immm4 = pc + immm4 - 4;
-
                     let mut immm4: u32 = ((ir & 0xf00) >> 7)
                         | ((ir & 0x7e000000) >> 20)
                         | ((ir & 0x80) << 4)
@@ -656,11 +719,6 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     let rs2: i32 = state.reg((ir >> 20) & 0x1f) as i32;
 
                     immm4 = immm4.wrapping_add(pc).wrapping_sub(4);
-
-                    if DEBUG_INSTR {
-                        //println!("BRANCH 0x{:08x} 0x{:08x} 0x{:08x}", rs1, rs2, immm4);
-                    }
-                    //immm4 = pc + immm4 - 4;
                     rdid = 0;
                     match (ir >> 12) & 0x7 {
                         // BEQ, BNE, BLT, BGE, BLTU, BGEU
@@ -788,7 +846,8 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                 //SYSCON (reboot, poweroff, etc.)
 
                                 state.pc = state.pc + 4;
-                                return rs2 as i32; // NOTE: PC will be PC of Syscon.
+                                step_return = rs2 as i32; // NOTE: PC will be PC of Syscon.
+                                break;
                             } else {
                                 handler.handle_mem_store_control(addy, rs2);
                             }
@@ -940,7 +999,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             0x340 => rval = state.mscratch,
                             0x305 => rval = state.mtvec,
                             0x304 => rval = state.mie,
-                            0xC00 => rval = state.cyclel,
+                            0xC00 => {
+                                rval = state.increment_cycles(&mut icount, &mut remaining_count)
+                            }
                             0x344 => rval = state.mip,
                             0x341 => rval = state.mepc,
                             0x300 => rval = state.mstatus, //mstatus
@@ -1015,7 +1076,8 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             state.mstatus |= 8; //Enable interrupts
                             state.extraflags |= 4; //Infor environment we want to go to sleep.
                             state.pc = pc + 4;
-                            return 1;
+                            step_return = 1;
+                            break;
                         } else if (csrno & 0xff) == 0x02 {
                             // MRET
 
@@ -1140,9 +1202,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
             }
         }
 
-        let ret = handler.postexec(pc, ir, trap);
-        if ret != 0 {
-            return ret;
+        step_return = handler.postexec(pc, ir, trap);
+        if step_return != 0 {
+            break;
         }
 
         // Handle traps and interrupts.
@@ -1151,11 +1213,23 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
         }
 
         state.pc = pc.wrapping_add(4);
+        icount += 1;
     }
-    return 0;
+
+    {
+        // Increment clock by the number of run
+        let lastl = state.cyclel;
+        let newl = lastl + icount as u32;
+        state.cyclel = newl;
+        if newl < lastl {
+            state.cycleh += 1;
+        }
+    }
+
+    return step_return;
 }
 
-#[inline(never)]
+#[cold]
 fn rv32_handle_trap(state: &mut MiniRV32IMAState, trap: u32, pc: &mut u32, rval: u32) {
     if trap & 0x80000000 != 0 {
         // If prefixed with 0x100, it's an interrupt, not a trap.
