@@ -5,3 +5,4 @@ edition = "2021"
 
 
 [dependencies]
+pprof = { version = "0.11", features = ["flamegraph"] }
