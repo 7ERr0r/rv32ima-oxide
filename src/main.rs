@@ -14,8 +14,6 @@
         * Feel free to override any of the functionality with macros.
 */
 
-use std::fs::File;
-
 static DEBUG_INSTR: bool = false;
 
 pub fn main() {
@@ -788,24 +786,24 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             rval = rsval;
                         }
                     } else {
-                        match (ir >> 12) & 0b111 {
+                        match ir & (0b111 << 12) {
                             //LB, LH, LW, LBU, LHU
-                            0b000 => {
+                            0b000_000000000000 => {
                                 rval = image.load8(rsval) as i8 as u32;
                             }
-                            0b001 => {
+                            0b001_000000000000 => {
                                 rval = image.load16(rsval) as i16 as u32;
                             }
-                            0b010 => {
+                            0b010_000000000000 => {
                                 rval = image.load32(rsval);
                                 if DEBUG_INSTR {
                                     //println!("load32 image[0x{:08x}] = 0x{:08x}", rsval, rval);
                                 }
                             }
-                            0b100 => {
+                            0b100_000000000000 => {
                                 rval = image.load8(rsval) as u32;
                             }
-                            0b101 => {
+                            0b101_000000000000 => {
                                 rval = image.load16(rsval) as u32;
                             }
                             _default => {
@@ -856,15 +854,15 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             rval = addy.wrapping_add(MINIRV32_RAM_IMAGE_OFFSET);
                         }
                     } else {
-                        match (ir >> 12) & 0b111 {
+                        match ir & (0b111 << 12) {
                             //SB, SH, SW
-                            0b000 => {
+                            0b000_000000000000 => {
                                 image.store8(addy, rs2 as u8);
                             }
-                            0b001 => {
+                            0b001_000000000000 => {
                                 image.store16(addy, rs2 as u16);
                             }
-                            0b010 => {
+                            0b010_000000000000 => {
                                 image.store32(addy, rs2);
                             }
                             _default => {
@@ -894,42 +892,42 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     }
 
                     if is_reg && (ir & 0x02000000 != 0) {
-                        match (ir >> 12) & 7 {
+                        match ir & (0b111 << 12) {
                             //0x02000000 = RV32M
-                            0b000 => {
+                            0b000_000000000000 => {
                                 rval = rs1.wrapping_mul(rs2);
                             } // MUL
-                            0b001 => {
+                            0b001_000000000000 => {
                                 rval = (((rs1 as i32 as i64) * (rs2 as i32 as i64)) >> 32) as u32;
                             } // MULH
-                            0b010 => {
+                            0b010_000000000000 => {
                                 rval = (((rs1 as i32 as i64) * (rs2 as u64 as i64)) >> 32) as u32;
                             } // MULHSU
-                            0b011 => {
+                            0b011_000000000000 => {
                                 rval = (((rs1 as u64) * (rs2 as u64)) >> 32) as u32;
                             } // MULHU
-                            0b100 => {
+                            0b100_000000000000 => {
                                 if rs2 == 0 {
                                     rval = -1 as i32 as u32;
                                 } else {
                                     rval = ((rs1 as i32) / (rs2 as i32)) as u32;
                                 }
                             } // DIV
-                            0b101 => {
+                            0b101_000000000000 => {
                                 if rs2 == 0 {
                                     rval = 0xffffffff;
                                 } else {
                                     rval = rs1 / rs2;
                                 }
                             } // DIVU
-                            0b110 => {
+                            0b110_000000000000 => {
                                 if rs2 == 0 {
                                     rval = rs1;
                                 } else {
                                     rval = ((rs1 as i32) % (rs2 as i32)) as u32;
                                 }
                             } // REM
-                            0b111 => {
+                            0b111_000000000000 => {
                                 if rs2 == 0 {
                                     rval = rs1;
                                 } else {
@@ -939,9 +937,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             _default => {}
                         }
                     } else {
-                        match (ir >> 12) & 0b111 {
+                        match ir & (0b111 << 12) {
                             // These could be either op-immediate or op commands.  Be careful.
-                            0b000 => {
+                            0b000_000000000000 => {
                                 // addi
                                 rval = if is_reg && (ir & 0x40000000) != 0 {
                                     rs1.wrapping_sub(rs2)
@@ -949,29 +947,29 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                     rs1.wrapping_add(rs2)
                                 };
                             }
-                            0b001 => {
+                            0b001_000000000000 => {
                                 rval = rs1.wrapping_shl(rs2);
                             }
-                            0b010 => {
+                            0b010_000000000000 => {
                                 rval = ((rs1 as i32) < (rs2 as i32)) as u32;
                             }
-                            0b011 => {
+                            0b011_000000000000 => {
                                 rval = (rs1 < rs2) as u32;
                             }
-                            0b100 => {
+                            0b100_000000000000 => {
                                 rval = rs1 ^ rs2;
                             }
-                            0b101 => {
+                            0b101_000000000000 => {
                                 rval = if ir & 0x40000000 != 0 {
                                     ((rs1 as i32).wrapping_shr(rs2)) as u32
                                 } else {
                                     rs1.wrapping_shr(rs2)
                                 };
                             }
-                            0b110 => {
+                            0b110_000000000000 => {
                                 rval = rs1 | rs2;
                             }
-                            0b111 => {
+                            0b111_000000000000 => {
                                 rval = rs1 & rs2;
                             }
                             _default => {}
@@ -985,8 +983,8 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                     // Zifencei+Zicsr
 
                     let csrno = ir >> 20;
-                    let microop = (ir >> 12) & 0b111;
-                    if (microop & 3) != 0 {
+                    let microop_raw = ir & (3 << 12);
+                    if microop_raw != 0 {
                         // It's a Zicsr function.
 
                         let rs1imm = (ir >> 15) & 0x1f;
@@ -1024,23 +1022,23 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                             }
                         }
 
-                        match microop {
-                            0b001 => {
+                        match ir & (0b111 << 12) {
+                            0b001_000000000000 => {
                                 writeval = rs1;
                             } //CSRRW
-                            0b010 => {
+                            0b010_000000000000 => {
                                 writeval = rval | rs1;
                             } //CSRRS
-                            0b011 => {
+                            0b011_000000000000 => {
                                 writeval = rval & !rs1;
                             } //CSRRC
-                            0b101 => {
+                            0b101_000000000000 => {
                                 writeval = rs1imm;
                             } //CSRRWI
-                            0b110 => {
+                            0b110_000000000000 => {
                                 writeval = rval | rs1imm;
                             } //CSRRSI
-                            0b111 => {
+                            0b111_000000000000 => {
                                 writeval = rval & !rs1imm;
                             } //CSRRCI
                             _default => {}
@@ -1066,7 +1064,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                                 handler.othercsr_write(&image, csrno, writeval);
                             }
                         }
-                    } else if microop == 0b000 {
+                    } else if microop_raw == 0b000 << 12 {
                         // "SYSTEM"
 
                         rdid = 0;
