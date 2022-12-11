@@ -13,5 +13,5 @@ clap = { version = "4.0.29", features = ["derive"] }
 debug = true
 lto = "fat"
 codegen-units = 1
-#panic = "abort"
+#panic = "abort" # used to cheat a little in benchmarks
 

@@ -1,6 +1,25 @@
 rv32ima-oxide
 ===
 Copy-paste from https://github.com/cnlohr/mini-rv32ima into Rust
+```
+Options:
+  -m, --memory-ram <MEMORY_RAM>
+          RAM amount [default: 64 * 1024 * 1024]
+  -c, --count-instruction <COUNT_INSTRUCTION>
+          Instruction count
+  -r, --repeat <REPEAT>
+          Number of times to repeat - useful for benchmarking [default: 1]
+  -l, --lock-time-update
+          Lock time base to instruction count. Use locked time update to disable realtime system clock
+  -t, --time-divisor <TIME_DIVISOR>
+          Slowdown used for a fixed-time step [default: 1]
+  -s, --single-step
+          Useful for debugging. Prints processor state in every step
+  -p, --presto-disable-sleep
+          Use to disable micro-sleep when wfi
+  -f, --file-image <FILE_IMAGE>
+          Path to running image file
+```
 
 
 # Run
@@ -61,4 +80,24 @@ uart: "Welcome to Buildroot\r\n"
 uart: "\rbuildroot login: "
 ^C
 
+```
+
+
+Benchmarks
+===
+Best times in 20 rounds:
+
+```
+time bash -c "mini-rv32ima -f DownloadedImage -c 46000000 -p -l > out.txt"
+
+real    0m0,305s
+user    0m0,262s
+sys     0m0,043s
+
+
+time bash -c "rv32ima-oxide -c 46000000 -p -l > out.txt"
+
+real    0m0,309s
+user    0m0,294s
+sys     0m0,013s
 ```

@@ -11,7 +11,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct RVArgs {
-    /// Instruction count
+    /// RAM amount
     #[arg(short, long, default_value_t = 64 * 1024 * 1024)]
     memory_ram: u32,
 
