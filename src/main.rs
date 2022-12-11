@@ -1,6 +1,8 @@
 // Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
 // Modified by 7ERr0r and converted to Rust
 
+
+
 use std::{fs::File, hint::unreachable_unchecked, io::Read, path::PathBuf};
 
 use clap::Parser;
@@ -155,14 +157,13 @@ pub fn run_emu<H: RVHandler>(
     };
     let instrs_per_flip = if single_step { 1 } else { 1024 };
     let mut rt: u64 = 0;
-    while rt < max_instr_count + 1 {
-        let elapsed_us: u64;
-        if fixed_time_update {
-            elapsed_us = proc_state.cycle() / time_divisor - last_time;
+    while rt < max_instr_count {
+        let elapsed_us = if fixed_time_update {
+            (proc_state.cycle() / time_divisor - last_time) as u32
         } else {
-            elapsed_us = time_now_micros() / time_divisor - last_time;
-        }
-        last_time += elapsed_us;
+            (time_now_micros() / time_divisor - last_time) as u32
+        };
+        last_time += elapsed_us as u64;
 
         if single_step {
             let mut ram_image = RVImageRam::new(vec_image);
@@ -700,6 +701,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     elapsed_us: u32,
     mut remaining_count: u16,
 ) -> i32 {
+    let ram_minus_4byte = image.len_minus_4();
     let new_timer: u32 = state.timerl + elapsed_us;
     if new_timer < state.timerl {
         state.timerh += 1;
@@ -722,25 +724,24 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     }
 
     let mut step_return = 0;
-    let ram_minus_4byte = image.len_minus_4();
-
     let mut pc: u32 = state.pc;
 
     let mut icount = 0;
     while icount < remaining_count {
-        let mut ir = 0;
+        
         let mut trap = 0; // If positive, is a trap or interrupt.  If negative, is fatal error.
         let mut rval = 0;
 
         // changed to increment_cycles() only when needed
 
         let ofs_pc: u32 = pc.wrapping_sub(MINIRV32_RAM_IMAGE_OFFSET);
-
+        let mut ir = 0;
         if ofs_pc >= ram_minus_4byte {
             trap = 1 + 1; // Handle access violation on instruction read.
         } else if ofs_pc & 3 != 0 {
             trap = 1 + 0; //Handle PC-misaligned access
         } else {
+            
             ir = image.load32(ofs_pc);
 
             let mut rdid: u8 = ((ir >> 7) & 0x1f) as u8;
@@ -759,16 +760,16 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                 0b1101111 => {
                     // // JAL
 
-                    let mut reladdy: i32 = (((ir & 0x80000000) >> 11)
+                    let mut reladdy: u32 = ((ir & 0x80000000) >> 11)
                         | ((ir & 0x7fe00000) >> 20)
                         | ((ir & 0x00100000) >> 9)
-                        | (ir & 0x000ff000)) as i32;
+                        | (ir & 0x000ff000);
 
                     if reladdy & 0x00100000 != 0 {
-                        reladdy |= 0xffe00000 as u32 as i32; // Sign extension.
+                        reladdy |= 0xffe00000 as u32; // Sign extension.
                     }
-                    rval = pc + 4;
-                    pc = (pc as i32 + reladdy).wrapping_sub(4) as u32;
+                    rval = pc.wrapping_add(4);
+                    pc = (pc as i32 + reladdy as i32).wrapping_sub(4) as u32;
                 }
                 0b1100111 => {
                     // JALR
@@ -888,9 +889,10 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                 }
                 0b0100011 => {
                     // Store
-
-                    let rs1: u32 = state.reg((ir >> 15) & 0b11111);
-                    let rs2: u32 = state.reg((ir >> 20) & 0b11111);
+                    let reg1 = (ir >> 15) & 0b11111;
+                    let reg2 = (ir >> 20) & 0b11111;
+                    let rs1: u32 = state.reg(reg1);
+                    let rs2: u32 = state.reg(reg2);
                     let mut addy: u32 = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
                     if addy & 0x800 != 0 {
                         addy |= 0xfffff000;
@@ -946,9 +948,9 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
                 0b0110011 | 0b0010011 => {
                     // Op // Op-immediate
 
-                    let imm = ir >> 20;
+                    let mut imm = ir >> 20;
                     let extenstion = if imm & 0x800 != 0 { 0xfffff000 } else { 0 };
-                    let imm = imm | extenstion;
+                    imm = imm | extenstion;
                     let rs1 = state.reg((ir >> 15) & 0x1f);
                     let is_reg = (ir & 0b100000) != 0;
                     let rs2 = if is_reg { state.reg(imm & 0x1f) } else { imm };
@@ -1289,7 +1291,7 @@ pub fn mini_rv32_ima_step<H: RVHandler>(
     state.pc = pc;
 
     {
-        // Increment clock by the number of run
+        // Increment clock by the number of run instructions
         let lastl = state.cyclel;
         let newl = lastl + icount as u32;
         state.cyclel = newl;

@@ -11,3 +11,7 @@ clap = { version = "4.0.29", features = ["derive"] }
 
 [profile.release]
 debug = true
+lto = "fat"
+codegen-units = 1
+#panic = "abort"
+
